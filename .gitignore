@@ -1,0 +1,9 @@
+build/
+dist/
+FortsGFX/
+*.bak*
+*.log
+__pycache__/
+# previews made while working; the ones the README shows live in docs/images
+/*.png
+/*.jpg
