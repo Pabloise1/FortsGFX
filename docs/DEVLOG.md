@@ -6,6 +6,20 @@ A proxy `opengl32.dll` for Forts. Windows loads it from the game folder instead 
 system one; it forwards every OpenGL call to the real `C:\Windows\System32\opengl32.dll`
 and adds a graphics layer on top.
 
+## Vulkan, phase V0 — recon
+
+Forts' Vulkan renderer (`EnableVulkan = true` in `users\<id>\settings_hardware.lua`) is native Vulkan with its own
+SPIR-V shaders (`data\shaders\*.spv`), so the OpenGL hooks see nothing. Forts still imports opengl32.dll, and it loads
+vulkan-1.dll itself and gets `vkGetInstanceProcAddr` through `GetProcAddress`. `src/vulkan.cpp` hooks that call in
+Forts.exe's import table and wraps the Vulkan functions the game looks up, so one DLL covers both renderers.
+V0 only watches: `vulkan.log` (instance, device, swapchain, render passes, shaders by name, pipelines with vertex
+layout and blend, descriptor layouts, a 10 s summary of what a frame does), `VKIMG` lines in loading.log (each image
+with the DevIL file just loaded), and `vk_frame_NN.txt` + `.png` (every command of one frame, with the first vertices
+of each draw decoded from mapped memory, and the presented image copied out after the game's semaphores) on
+Ctrl+Shift+F11, 10 s in and then once a minute, at most 8. The swapchain gets `TRANSFER_SRC` added when the surface
+allows it, for that copy. `[Vulkan] Hook=0` turns it all off. Headers: `third_party/vulkan` (Vulkan-Headers 1.4.309).
+`tools/vktest.cpp` tests it without the game (imports our opengl32.dll from `build\`, draws 13 s of frames).
+
 ## 1.1 — rebindable keys
 
 Control panel → *Keys*: every hotkey (panel, Lab bar, photo mode, looks, on/off, lighting) is a button

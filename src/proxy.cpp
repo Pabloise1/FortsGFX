@@ -345,6 +345,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     SessionLog("%zu generic exports forwarded (%zu missing)", kEntryCount, missing);
 
     InstallIatHooks();
+    VkInstallHooks();
     SessionLog("capture: press Ctrl+Shift+F11 in game, or create %scapture.trigger", Narrow(g_outDir.c_str()).c_str());
     return TRUE;
 }

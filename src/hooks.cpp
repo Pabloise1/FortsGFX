@@ -153,6 +153,12 @@ static std::string IlName() {
     return it != g_ilNames.end() ? it->second : Fmt("il#%u", g_ilBound);
 }
 
+std::string HookFreshImageName() {
+    if (!g_ilFresh) return "";
+    g_ilFresh = false;
+    return IlName();
+}
+
 std::string TexDescribe(GLuint id) {
     std::lock_guard<std::mutex> lk(g_texMx);
     auto it = g_tex.find(id);

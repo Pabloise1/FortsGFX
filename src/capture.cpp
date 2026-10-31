@@ -681,6 +681,22 @@ static void SavePhoto() {
     }).detach();
 }
 
+// A frame read back by the Vulkan recon (vulkan.cpp): RGBA, top row first.
+void CapSaveRgbaPng(const std::wstring& path, int w, int h, std::vector<uint8_t>&& rgba) {
+    Image* img = new Image;
+    img->w = w; img->h = h; img->px = std::move(rgba); img->opaque = true;
+    std::thread([img, path] {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        IWICImagingFactory* f = nullptr;
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f));
+        bool ok = f && WritePng(f, path, *img);
+        if (f) f->Release();
+        CoUninitialize();
+        if (!ok) SessionLog("vulkan: could not write %s", Narrow(path.c_str()).c_str());
+        delete img;
+    }).detach();
+}
+
 void CapFrameEnd() {
     g_frame++;
     HistRecord();

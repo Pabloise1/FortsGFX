@@ -95,6 +95,7 @@ bool LoadRealExt();
 extern bool g_compiling;            // inside glNewList/glEndList
 void ResolveStaticHooks(HMODULE real);
 void InstallIatHooks();
+std::string HookFreshImageName();   // the image DevIL just loaded, if nothing has used it yet ("" otherwise); used up
 void ListNoteCall(const char* fn);
 std::string TexDescribe(GLuint id);
 std::string TexShort(GLuint id);
@@ -213,6 +214,10 @@ void CapRequest(const char* label);           // test bench: capture this frame,
 void GfxTourChapter(int chapter);              // showcase map: show this tour chapter (< 0: end the tour)
 bool GfxWaterVisible();                       // a sea is on screen (water effects running)
 void CapRequestPhoto();                      // photo mode: save this frame (no UI) to the Photos folder
+void CapSaveRgbaPng(const std::wstring& path, int w, int h, std::vector<uint8_t>&& rgba);   // on a worker thread
+
+// ---- vulkan.cpp ----
+void VkInstallHooks();               // Forts' Vulkan renderer: watch it (GetProcAddress in Forts.exe's imports)
 
 // engine.cpp: the game's own events, read from its functions (read-only)
 void EngineInit();    // first frame: find the functions and start watching
