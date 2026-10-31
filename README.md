@@ -47,6 +47,10 @@ If Forts is somewhere Steam doesn't know about, run
 | **Ctrl+F9** | Reload settings from `FortsGFX.ini` |
 | **Ctrl+Shift+F11** | Capture a frame for a bug report (large: ~170 MB) |
 
+**Changing keys:** open the control panel → **Keys**, click the key next to an action and press the new
+one (Esc cancels). It's saved straight away, and *Default keys* puts them all back. Forts still sees these
+keys too, so pick ones the game doesn't use.
+
 Settings are saved in `FortsGFX.ini` in the Forts folder. Logs go to the `FortsGFX` folder next to it.
 
 ## What it adds

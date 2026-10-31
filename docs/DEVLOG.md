@@ -6,7 +6,18 @@ A proxy `opengl32.dll` for Forts. Windows loads it from the game folder instead 
 system one; it forwards every OpenGL call to the real `C:\Windows\System32\opengl32.dll`
 and adds a graphics layer on top.
 
-## Phases 4–5 — showcase effects, weather, 3D backdrop, control panel (current)
+## 1.1 — rebindable keys
+
+Control panel → *Keys*: every hotkey (panel, Lab bar, photo mode, looks, on/off, lighting) is a button
+showing its key; click it and press the new one (`kHotKeys` / `BindPoll` in `overlay.cpp`). Mouse buttons
+and Shift / Ctrl / Alt / Windows are ignored, Esc cancels, a key another hotkey has swaps with it, and the
+new key is written to the ini at once (`WritePrivateProfileString`, nothing else is saved). While waiting,
+and until the new key is let go, no hotkey fires (`OverlayKeyBlocked`, also used by F9 / F10 in `gfx.cpp`)
+and the keyboard is held back from the game, so the press doesn't also do something in Forts. Every hint
+that names a key (tooltips, the Lab bar, the tour's captions) shows the bound key. The raw `...KeyVK`
+number fields are gone from the other sections.
+
+## Phases 4–5 — showcase effects, weather, 3D backdrop, control panel
 
 **Control panel** — press **Insert** in game (Dear ImGui, `third_party/imgui`, MIT). Live fps/frame
 graphs, *Showcase / Cinematic / Clean* style presets and *Low / High / Ultra* quality presets (▲/▼

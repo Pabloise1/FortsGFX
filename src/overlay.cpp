@@ -64,15 +64,100 @@ static void* SettingPtr(const char* sec, const char* key) {
     return nullptr;
 }
 
+// ---------------------------------------------------------------- keys
+// The hotkeys, rebindable in the panel's Keys section: click one, then press the new key (Esc cancels; a key
+// another hotkey has swaps with it). The new key goes into the ini at once and does nothing until it is let go.
+struct HotKey { const char* section; const char* key; const char* label; int def; };
+static const HotKey kHotKeys[] = {
+    { "Post", "OverlayKeyVK", "Control panel", VK_INSERT },
+    { "Post", "LabKeyVK", "Lab bar", VK_HOME },
+    { "Post", "PhotoKeyVK", "Photo mode", VK_END },
+    { "Post", "LookPrevKeyVK", "Previous look", VK_F7 },
+    { "Post", "LookNextKeyVK", "Next look", VK_F8 },
+    { "Post", "ToggleKeyVK", "FortsGFX on / off (with Ctrl: reload the ini)", VK_F9 },
+    { "Lighting", "ToggleKeyVK", "Lighting on / off", VK_F10 },
+};
+enum { kKeyPanel, kKeyLab, kKeyPhoto, kKeyLookPrev, kKeyLookNext, kKeyToggle, kKeyLighting, kHotKeyCount };
+static int g_bindSlot = -1, g_swallowVk;   // the hotkey waiting for a key; the key just bound, until let go
+static bool g_bindHeld[256];
+
+static int* HotKeyPtr(int i) { return (int*)SettingPtr(kHotKeys[i].section, kHotKeys[i].key); }
+
+static const char* KeyName(int vk) {
+    static char buf[8][32];
+    static int n;
+    char* out = buf[n++ & 7];
+    // Extended keys (GetKeyNameText would name their numpad twins) and the ones it spells in capitals
+    switch (vk) {
+    case VK_INSERT: return "Insert";    case VK_DELETE: return "Delete";      case VK_HOME: return "Home";
+    case VK_END: return "End";          case VK_PRIOR: return "Page Up";      case VK_NEXT: return "Page Down";
+    case VK_LEFT: return "Left";        case VK_RIGHT: return "Right";        case VK_UP: return "Up";
+    case VK_DOWN: return "Down";        case VK_PAUSE: return "Pause";        case VK_NUMLOCK: return "Num Lock";
+    case VK_SNAPSHOT: return "Print Screen"; case VK_APPS: return "Menu";     case VK_SCROLL: return "Scroll Lock";
+    case VK_DIVIDE: return "Num /";     case VK_MULTIPLY: return "Num *";     case VK_ADD: return "Num +";
+    case VK_SUBTRACT: return "Num -";   case VK_DECIMAL: return "Num .";      case VK_SPACE: return "Space";
+    case VK_TAB: return "Tab";          case VK_CAPITAL: return "Caps Lock";  case VK_BACK: return "Backspace";
+    case VK_RETURN: return "Enter";     case VK_OEM_102: return "\\ (by Shift)";
+    }
+    if (vk >= VK_F1 && vk <= VK_F24) { snprintf(out, 32, "F%d", vk - VK_F1 + 1); return out; }
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) { snprintf(out, 32, "Num %d", vk - VK_NUMPAD0); return out; }
+    wchar_t w[32];   // letters, digits and the punctuation keys of the user's own layout
+    UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    if (sc && GetKeyNameTextW((LONG)(sc << 16), w, 32) > 0) snprintf(out, 32, "%s", Narrow(w).c_str());
+    else snprintf(out, 32, "key %d", vk);
+    return out;
+}
+static const char* HotKeyName(int i) { int* p = HotKeyPtr(i); return KeyName(p ? *p : kHotKeys[i].def); }
+
+static void WriteHotKey(int i) {
+    WritePrivateProfileStringW(Widen(kHotKeys[i].section).c_str(), Widen(kHotKeys[i].key).c_str(),
+                               std::to_wstring(*HotKeyPtr(i)).c_str(), (g_gameDir + L"FortsGFX.ini").c_str());
+}
+
+static void BindStart(int i) {
+    g_bindSlot = i;
+    for (int vk = 0; vk < 256; vk++) g_bindHeld[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
+// Waiting for a key: the first one that goes down becomes the hotkey - not the mouse buttons, Shift, Ctrl,
+// Alt or Windows.
+static void BindPoll(bool focused) {
+    for (int vk = 8; vk < 255; vk++) {
+        bool down = focused && (GetAsyncKeyState(vk) & 0x8000) != 0, edge = down && !g_bindHeld[vk];
+        g_bindHeld[vk] = down;
+        bool modifier = vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || (vk >= VK_LSHIFT && vk <= VK_RMENU) ||
+                        vk == VK_LWIN || vk == VK_RWIN;
+        if (!edge || modifier) continue;
+        int slot = g_bindSlot, *p = HotKeyPtr(slot);
+        g_bindSlot = -1;
+        g_swallowVk = vk;
+        if (vk == VK_ESCAPE || !p || *p == vk) return;
+        int old = *p, other = -1;
+        for (int j = 0; j < kHotKeyCount; j++)
+            if (j != slot && HotKeyPtr(j) && *HotKeyPtr(j) == vk) { other = j; *HotKeyPtr(j) = old; WriteHotKey(j); }
+        *p = vk;
+        WriteHotKey(slot);
+        if (other >= 0) Toast("%s: %s   (%s is now %s)", kHotKeys[slot].label, KeyName(vk), kHotKeys[other].label, KeyName(old));
+        else Toast("%s: %s", kHotKeys[slot].label, KeyName(vk));
+        SessionLog("overlay: %s key set to %s (%d)%s", kHotKeys[slot].label, KeyName(vk), vk, other >= 0 ? ", swapped" : "");
+        return;
+    }
+}
+
+bool OverlayKeyBlocked(int vk) { return g_bindSlot >= 0 || (vk && vk == g_swallowVk); }
+
 // The mouse is held back from the game while it is over our UI, a lab tool is armed or photo mode is on;
-// the keyboard only while you are typing into one of our text fields (camera keys keep working).
+// the keyboard only while you are typing into one of our text fields or binding a hotkey (camera keys
+// keep working).
 static bool WantsMouse() {
     if (!g_init || !(g_open || g_labOpen || g_photo)) return false;
     ImGuiIO& io = ImGui::GetIO();
     return io.WantCaptureMouse || g_tool != kToolNone || g_photo;
 }
 static bool WantsKeys() {
-    if (!g_init || !(g_open || g_labOpen || g_photo)) return false;
+    if (!g_init) return false;
+    if (g_bindSlot >= 0 || g_swallowVk) return true;
+    if (!(g_open || g_labOpen || g_photo)) return false;
     return ImGui::GetIO().WantTextInput;
 }
 
@@ -85,7 +170,7 @@ static LRESULT CALLBACK OverlayWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         bool mouse = msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST;
         bool key = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || msg == WM_CHAR;
         bool toolMouse = (g_tool != kToolNone || g_photo) && msg != WM_MOUSEWHEEL;   // a lab tool / photo mode owns the clicks, zoom still works
-        if ((mouse && (io.WantCaptureMouse || toolMouse)) || (key && io.WantTextInput)) {
+        if ((mouse && (io.WantCaptureMouse || toolMouse)) || (key && WantsKeys())) {
             static bool logged;
             if (!logged && msg == WM_LBUTTONDOWN) { logged = true; SessionLog("overlay: a click on the panel was kept from the game"); }
             return 0;
@@ -285,7 +370,8 @@ static void LookCombo() {
     for (int i = 0; i < n; i++) names[i] = GfxLookName(i);
     int v = std::min(std::max(*GfxCurrentLook(), 0), n - 1);
     if (ComboCycle("Look", &v, names.data(), n)) { GfxApplyLook(v); LookToast(v); }
-    Tip("A complete style: colour grade, lighting, materials, sky, fog, weather and effects. F7 / F8 switch looks any time.");
+    Tip(Fmt("A complete style: colour grade, lighting, materials, sky, fog, weather and effects. %s / %s switch looks any time.",
+            HotKeyName(kKeyLookPrev), HotKeyName(kKeyLookNext)).c_str());
     ImGui::TextDisabled("%s", GfxLookDesc(v));
 }
 
@@ -298,8 +384,7 @@ static void SettingWidget(const GfxSetting& s) {
         if (!strcmp(s.section, "Weather") && !strcmp(s.key, "Mode")) {
             static const char* modes[] = { "Auto (follow the map)", "Off", "Rain", "Storm", "Snow", "Thick snow", "Sandstorm", "Fog banks", "Ash & embers" };
             ComboCycle("Weather", (int*)s.ptr, modes, 9);
-        } else if (strstr(s.key, "VK")) ImGui::InputInt(s.label, (int*)s.ptr);
-        else ImGui::SliderInt(s.label, (int*)s.ptr, (int)s.lo, (int)s.hi);
+        } else ImGui::SliderInt(s.label, (int*)s.ptr, (int)s.lo, (int)s.hi);
         break;
     case GfxSetting::Vec2: ImGui::SliderFloat2(s.label, (float*)s.ptr, s.lo, s.hi, "%.2f"); break;
     case GfxSetting::Color: ImGui::ColorEdit3(s.label, (float*)s.ptr, ImGuiColorEditFlags_Float); break;
@@ -335,8 +420,8 @@ static const TourStep kTour[] = {
     { "Day & night", "The sun crosses the sky: golden dusk, then a moonlit night", 10.0f, nullptr, nullptr, 0, 0, false, false, false },
     { "Water", "Reflections, foam and glints on the High Seas", 8.0f, "Water", "Enabled", -1, 0, true, true, false },
     { "Looks", "", 14.0f, nullptr, nullptr, 0, 0, false, false, false },
-    { "Photo mode", "Freeze, depth of field and framing - then save a clean PNG with no UI (End)", 7.0f, nullptr, nullptr, 0, 0, false, false, false },
-    { "FortsGFX", "Insert: panel     Home: Lab     F7 / F8: looks     End: photo mode", 6.0f, nullptr, nullptr, 0, 0, false, false, false },
+    { "Photo mode", "Freeze, depth of field and framing - then save a clean PNG with no UI", 7.0f, nullptr, nullptr, 0, 0, false, false, false },
+    { "FortsGFX", "", 6.0f, nullptr, nullptr, 0, 0, false, false, false },   // the keys (DrawCaption)
 };
 enum { kTourIntro, kTourLight, kTourMaterials, kTourExplosions, kTourBloom, kTourSmoke, kTourRain, kTourSnow, kTourFog,
        kTourDay, kTourWater, kTourLooks, kTourPhoto, kTourEnd };
@@ -536,10 +621,18 @@ static void DrawCaption(ImDrawList* dl, ImVec2 ds) {
     float a = (float)std::min(std::min(t / 0.45, (st.dur - t) / 0.45), 1.0);
     a = std::max(a, 0.0f);
     const char* sub = st.sub;
-    char lookSub[128];
+    char keySub[160];
     if (g_step == kTourLooks && g_tourLook >= 0) {
-        snprintf(lookSub, sizeof(lookSub), "%s   (%d complete styles  -  F7 / F8 to switch)", kTourLookNames[g_tourLook], GfxLookCount());
-        sub = lookSub;
+        snprintf(keySub, sizeof(keySub), "%s   (%d complete styles  -  %s / %s to switch)", kTourLookNames[g_tourLook], GfxLookCount(),
+                 HotKeyName(kKeyLookPrev), HotKeyName(kKeyLookNext));
+        sub = keySub;
+    } else if (g_step == kTourPhoto) {
+        snprintf(keySub, sizeof(keySub), "%s (%s)", st.sub, HotKeyName(kKeyPhoto));
+        sub = keySub;
+    } else if (g_step == kTourEnd) {
+        snprintf(keySub, sizeof(keySub), "%s: panel     %s: Lab     %s / %s: looks     %s: photo mode", HotKeyName(kKeyPanel),
+                 HotKeyName(kKeyLab), HotKeyName(kKeyLookPrev), HotKeyName(kKeyLookNext), HotKeyName(kKeyPhoto));
+        sub = keySub;
     }
     ImFont* f = ImGui::GetFont();
     float ts = 60.0f * g_scale, ss = 26.0f * g_scale;
@@ -704,7 +797,7 @@ static void DrawLabBar() {
     if (n > 0) {
         int cur = std::min(std::max(*GfxCurrentLook(), 0), n - 1);
         if (ImGui::ArrowButton("##lookprev", ImGuiDir_Left)) StepLook(-1);
-        Tip("Previous look (F7)");
+        Tip(Fmt("Previous look (%s)", HotKeyName(kKeyLookPrev)).c_str());
         ImGui::SameLine();
         char lbl[96];
         snprintf(lbl, sizeof(lbl), "%s##lookname", GfxLookName(cur));
@@ -714,7 +807,7 @@ static void DrawLabBar() {
         Tip(GfxLookDesc(cur));
         ImGui::SameLine();
         if (ImGui::ArrowButton("##looknext", ImGuiDir_Right)) StepLook(+1);
-        Tip("Next look (F8)");
+        Tip(Fmt("Next look (%s)", HotKeyName(kKeyLookNext)).c_str());
         ImGui::SameLine();
         if (BarToggle("Auto", g_cycle, "Cycle through the looks automatically")) { g_cycle = !g_cycle; g_cycleT = NowS(); }
     }
@@ -799,10 +892,10 @@ static void DrawLabBar() {
     BarGap();
     if (BarToggle("More", g_more, "Sliders and switches")) g_more = !g_more;
     ImGui::SameLine();
-    if (BarToggle("Panel", g_open, "The full control panel (Insert)")) g_open = !g_open;
+    if (BarToggle("Panel", g_open, Fmt("The full control panel (%s)", HotKeyName(kKeyPanel)).c_str())) g_open = !g_open;
     ImGui::SameLine();
     if (ImGui::Button("X")) { g_labOpen = false; g_tool = kToolNone; GfxLabSetLight(0, false, 0, 0, 0, 0, g_lightCol); }
-    Tip("Close the lab bar (Home)");
+    Tip(Fmt("Close the lab bar (%s)", HotKeyName(kKeyLab)).c_str());
 
     // ---- rows 3-4 (More): light, sun, looks, systems
     if (g_more) {
@@ -1104,7 +1197,7 @@ static void DrawPhotoBar(ImDrawList* fg) {
     ImGui::PopStyleColor(2);
     ImGui::SameLine();
     if (ImGui::Button("Exit")) PhotoExit();
-    Tip("Leave photo mode (End)");
+    Tip(Fmt("Leave photo mode (%s)", HotKeyName(kKeyPhoto)).c_str());
     ImGui::End();
 }
 
@@ -1124,7 +1217,8 @@ static void DrawPanel() {
     ImGui::PlotLines("##gpu", g_gpuHist, kHist, g_histPos, "effects GPU time", 0.0f, maxMs * 1.1f, ImVec2(-1, 40 * g_scale));
     ImGui::Separator();
 
-    if (ImGui::Button(g_labOpen ? "Close the Lab bar (Home)" : "Open the Lab bar (Home)", ImVec2(-1, 34 * g_scale))) g_labOpen = !g_labOpen;
+    if (ImGui::Button(Fmt("%s the Lab bar (%s)###lab", g_labOpen ? "Close" : "Open", HotKeyName(kKeyLab)).c_str(), ImVec2(-1, 34 * g_scale)))
+        g_labOpen = !g_labOpen;
     Tip("Spawn explosions, lightning and lights, compare before/after, try looks, run the showcase tour");
     LookCombo();
     if (int* fxp = (int*)SettingPtr("Presets", "Effects")) {
@@ -1147,8 +1241,37 @@ static void DrawPanel() {
     ImGui::SameLine();
     if (ImGui::Button("Reload ini")) GfxReloadSettings();
     ImGui::SameLine();
-    ImGui::TextDisabled("Home lab   F7/F8 looks   F9 effects   F10 lighting   Ctrl+Shift+F11 capture");
+    ImGui::TextDisabled("%s lab   %s/%s looks   %s effects   %s lighting   Ctrl+Shift+F11 capture", HotKeyName(kKeyLab),
+                        HotKeyName(kKeyLookPrev), HotKeyName(kKeyLookNext), HotKeyName(kKeyToggle), HotKeyName(kKeyLighting));
     ImGui::Separator();
+
+    if (ImGui::CollapsingHeader("Keys")) {
+        for (int i = 0; i < kHotKeyCount; i++) {
+            if (!HotKeyPtr(i)) continue;
+            ImGui::PushID(i);
+            bool waiting = g_bindSlot == i;
+            if (waiting) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.08f, 0.05f, 0.02f, 1.0f));
+            }
+            if (ImGui::Button(Fmt("%s###bind", waiting ? "press a key..." : HotKeyName(i)).c_str(), ImVec2(170 * g_scale, 0))) {
+                if (waiting) g_bindSlot = -1;
+                else BindStart(i);
+            }
+            if (waiting) ImGui::PopStyleColor(2);
+            Tip(waiting ? "Press the new key (Esc cancels)" : "Click, then press the key you want");
+            ImGui::SameLine();
+            ImGui::TextUnformatted(kHotKeys[i].label);
+            ImGui::PopID();
+        }
+        if (ImGui::Button("Default keys")) {
+            g_bindSlot = -1;
+            for (int i = 0; i < kHotKeyCount; i++) if (int* p = HotKeyPtr(i)) { *p = kHotKeys[i].def; WriteHotKey(i); }
+            Toast("Keys back to the defaults");
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("Forts sees these keys too: pick ones the game doesn't use.");
+    }
 
     const auto& all = GfxSettings();
     static const char* order[] = { "Impact", "Weather", "Backdrop", "Post", "Lighting", "Materials", "Sun", "Fog", "Emitters" };
@@ -1158,7 +1281,7 @@ static void DrawPanel() {
     for (int i = 0; i < 9; i++) {
         if (!ImGui::CollapsingHeader(titles[i], i < 2 ? ImGuiTreeNodeFlags_DefaultOpen : 0)) continue;
         ImGui::PushItemWidth(-260 * g_scale);
-        for (auto& s : all) if (!strcmp(s.section, order[i])) SettingWidget(s);
+        for (auto& s : all) if (!strcmp(s.section, order[i]) && !strstr(s.key, "KeyVK")) SettingWidget(s);   // keys: Keys section
         ImGui::PopItemWidth();
     }
     ImGui::End();
@@ -1167,7 +1290,7 @@ static void DrawPanel() {
 // ---------------------------------------------------------------- per frame
 
 static bool KeyEdge(int vk, bool focused, bool& prev) {
-    bool down = focused && vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    bool down = focused && vk > 0 && !OverlayKeyBlocked(vk) && (GetAsyncKeyState(vk) & 0x8000) != 0;
     bool edge = down && !prev;
     prev = down;
     return edge;
@@ -1183,6 +1306,9 @@ void OverlayFrame() {
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
     bool focused = pid == GetCurrentProcessId();
+    if (!g_open) g_bindSlot = -1;
+    if (g_bindSlot >= 0) BindPoll(focused);
+    if (g_swallowVk && !(GetAsyncKeyState(g_swallowVk) & 0x8000)) g_swallowVk = 0;
     static bool pIns, pPrev, pNext, pLab, pPhoto;
     int prevKey = 0, nextKey = 0;
     GfxLookKeys(prevKey, nextKey);

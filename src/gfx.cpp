@@ -4949,8 +4949,8 @@ static bool OurWindowFocused() {
 static void PollKeys() {
     static bool prevPost, prevLight;
     bool focused = OurWindowFocused();
-    bool post = focused && (GetAsyncKeyState(cfg.toggleKey) & 0x8000) != 0;
-    bool light = focused && (GetAsyncKeyState(cfg.lightingKey) & 0x8000) != 0;
+    bool post = focused && !OverlayKeyBlocked(cfg.toggleKey) && (GetAsyncKeyState(cfg.toggleKey) & 0x8000) != 0;
+    bool light = focused && !OverlayKeyBlocked(cfg.lightingKey) && (GetAsyncKeyState(cfg.lightingKey) & 0x8000) != 0;
     if (post && !prevPost) {
         if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
             GfxReloadSettings();

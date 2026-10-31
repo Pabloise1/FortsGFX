@@ -22,7 +22,7 @@ void* RealProc(const char* name) {
     return (v > 3 && v != -1) ? (void*)p : nullptr;
 }
 
-static const char kVersion[] = "FortsGFX 1.0";
+static const char kVersion[] = "FortsGFX 1.1";
 
 // ---------------------------------------------------------------- strings
 

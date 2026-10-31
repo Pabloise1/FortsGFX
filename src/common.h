@@ -186,6 +186,7 @@ bool GfxHudMasked();                // hooks: the HUD is hidden, ignore the game
 
 // ---- overlay.cpp ----
 void OverlayFrame();                // just before SwapBuffers, after the capture read-back
+bool OverlayKeyBlocked(int vk);     // a hotkey is being bound in the panel, or vk was just bound: no hotkey fires
 typedef HRESULT (WINAPI* DI8CreateFn)(HINSTANCE, DWORD, const IID&, void**, void*);
 extern DI8CreateFn r_DirectInput8Create;
 extern "C" HRESULT WINAPI hk_DirectInput8Create(HINSTANCE, DWORD, const IID&, void**, void*);
