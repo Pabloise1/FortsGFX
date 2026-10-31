@@ -123,10 +123,19 @@ static std::string UsageName(VkImageUsageFlags u) {
 struct ImgInfo { int id; VkFormat fmt; uint32_t w, h, mips; VkImageUsageFlags usage; std::string name; };
 struct BufInfo { VkDeviceSize size; VkBufferUsageFlags usage; VkDeviceMemory mem; VkDeviceSize memOff; };
 struct MapInfo { uint8_t* ptr; VkDeviceSize off; };
-struct PipeInfo { int id; std::string shaders, blend; VkPrimitiveTopology topo; uint32_t stride[4]; std::vector<VkVertexInputAttributeDescription> attrs; };
+struct PipeInfo {
+    int id; std::string shaders, blend; VkPrimitiveTopology topo; uint32_t stride[4]; std::vector<VkVertexInputAttributeDescription> attrs;
+    bool blendOn; VkBlendFactor src, dst;   // colour blend of attachment 0
+    uint8_t frag;                           // the fragment shader: 0 texture x colour (frag.spv), 1 colour only, 2 scrolled texture, 3 other
+    bool uboMatrix;                         // verts.spv: the matrix is in a uniform buffer (set 1), not push constants
+};
+struct DescBuf { VkBuffer buf; VkDeviceSize off, range; };
+struct DescImg { VkImageView view; VkSampler sampler; };
+struct SamplerInfo { VkFilter mag, min; VkSamplerMipmapMode mip; VkSamplerAddressMode u, v; };
 struct FbInfo { std::vector<VkImageView> views; uint32_t w, h; };
 struct SwapInfo { VkFormat fmt; uint32_t w, h; bool copyable, writable; HWND wnd; std::vector<VkImage> images; };
 struct PushRec { VkPipelineLayout layout; VkShaderStageFlags stages; uint32_t off, size; uint8_t data[128]; };
+struct RDraw;
 struct CmdState {
     VkPipeline pipe = VK_NULL_HANDLE;
     VkBuffer vb[4] = {};
@@ -149,6 +158,10 @@ struct CmdState {
     bool hasViewport = false, hasScissor = false, hasLineWidth = false;
     VkCommandBuffer redirect = VK_NULL_HANDLE;   // after the split: where the game's commands for this one go
     int splitSlot = -1;
+    bool secondary = false;                      // recorded once and executed from frames (the terrain): its draws kept here
+    unsigned version = 0;                        // a new number each time it is recorded
+    bool sbroken = false;
+    const char* sWhy = nullptr;
 };
 static std::unordered_map<VkImage, ImgInfo> g_imgs;
 static std::unordered_map<VkImageView, VkImage> g_views;
@@ -156,7 +169,10 @@ static std::unordered_map<VkBuffer, BufInfo> g_bufs;
 static std::unordered_map<VkDeviceMemory, MapInfo> g_maps;
 static std::unordered_map<VkPipeline, PipeInfo> g_pipes;
 static std::unordered_map<VkShaderModule, std::string> g_shaders;
-static std::unordered_map<VkDescriptorSet, std::map<uint32_t, VkImageView>> g_sets;
+static std::unordered_map<VkDescriptorSet, std::map<uint32_t, DescImg>> g_sets;
+static std::unordered_map<VkSampler, SamplerInfo> g_samplers;
+static std::unordered_map<VkDescriptorSet, std::map<uint32_t, DescBuf>> g_setBufs;
+static std::unordered_map<VkCommandBuffer, bool> g_cmdSecondary;   // allocated as secondary command buffers
 static std::unordered_map<VkRenderPass, std::string> g_rps;
 static std::unordered_map<VkFramebuffer, FbInfo> g_fbs;
 static std::unordered_map<VkQueue, uint32_t> g_queueFamily;
@@ -198,10 +214,10 @@ REAL(vkCreateWin32SurfaceKHR); REAL(vkCreateSwapchainKHR); REAL(vkDestroySwapcha
 REAL(vkQueueSubmit); REAL(vkQueueSubmit2); REAL(vkQueueSubmit2KHR);
 REAL(vkCreateRenderPass); REAL(vkCreateRenderPass2); REAL(vkCreateRenderPass2KHR); REAL(vkCreateFramebuffer);
 REAL(vkCreateShaderModule); REAL(vkCreatePipelineLayout); REAL(vkCreateDescriptorSetLayout); REAL(vkCreateGraphicsPipelines);
-REAL(vkCreateImage); REAL(vkCreateImageView); REAL(vkCreateBuffer);
+REAL(vkCreateImage); REAL(vkDestroyImage); REAL(vkCreateSampler); REAL(vkCreateImageView); REAL(vkCreateBuffer);
 REAL(vkBindBufferMemory); REAL(vkBindBufferMemory2); REAL(vkBindBufferMemory2KHR); REAL(vkMapMemory); REAL(vkUnmapMemory);
 REAL(vkUpdateDescriptorSets); REAL(vkUpdateDescriptorSetWithTemplate);
-REAL(vkBeginCommandBuffer); REAL(vkEndCommandBuffer);
+REAL(vkBeginCommandBuffer); REAL(vkEndCommandBuffer); REAL(vkAllocateCommandBuffers); REAL(vkFreeCommandBuffers);
 REAL(vkCmdBeginRenderPass); REAL(vkCmdEndRenderPass);
 REAL(vkCmdBeginRendering); REAL(vkCmdBeginRenderingKHR); REAL(vkCmdEndRendering); REAL(vkCmdEndRenderingKHR);
 REAL(vkCmdBindPipeline); REAL(vkCmdBindDescriptorSets); REAL(vkCmdBindVertexBuffers); REAL(vkCmdBindIndexBuffer);
@@ -702,12 +718,20 @@ static bool BridgeEnsure(uint32_t family, const SwapInfo& s) {
     return BridgeCommands(family) && BridgeImages(s.w, s.h, srgb);
 }
 
-// GL's part, between semaphores A and B: IN -> FortsGFX (or as it was) -> OUT, then the control panel over OUT.
-static void GlStage(bool effects, bool panel, int32_t w, int32_t h) {
+static bool ReplayOn();
+static void MirrorFlush();
+static bool Replay(int32_t w, int32_t h);
+
+// GL's part, between semaphores A and B: the world drawn again in GL through FortsGFX (`replay`, at the HUD split), or
+// IN -> FortsGFX's image stages, or IN as it was -> OUT; then the control panel over OUT.
+static void GlStage(bool effects, bool panel, int32_t w, int32_t h, bool replay = false) {
     GlCurrent cur;
+    MirrorFlush();
     const GLenum inLayouts[2] = { kGlLayoutTransferDst, kGlLayoutTransferSrc };
     GL.WaitSemaphoreEXT(B.glSemA, 0, nullptr, 2, B.glTex, inLayouts);
-    if (!effects || !GfxBridgeFrame(B.glTex[0], B.glFbo[1], w, h)) {   // only the panel, or FortsGFX off (F9)
+    bool done = effects && replay && ReplayOn() && Replay(w, h);
+    if (!done && effects) done = GfxBridgeFrame(B.glTex[0], B.glFbo[1], w, h);
+    if (!done) {   // only the panel, or FortsGFX off (F9)
         GL.BindFramebuffer(kGlReadFb, B.glFbo[0]);
         GL.BindFramebuffer(kGlDrawFb, B.glFbo[1]);
         GL.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, kGlColorBit, kGlNearest);
@@ -821,7 +845,7 @@ static std::string DrawTexture(const CmdState& c) {   // what binding 0 of set 0
     if (s == g_sets.end()) return "";
     auto b = s->second.find(0);
     if (b == s->second.end()) return "";
-    auto v = g_views.find(b->second);
+    auto v = g_views.find(b->second.view);
     if (v == g_views.end()) return "";
     auto i = g_imgs.find(v->second);
     if (i == g_imgs.end()) return "";
@@ -987,7 +1011,7 @@ static bool SubmitSplit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f
     part1.push_back(s1);
     r = r_vkQueueSubmit(q, (uint32_t)part1.size(), part1.data(), VK_NULL_HANDLE);
     // 2. GL
-    if (r == VK_SUCCESS) GlStage(true, false, (int32_t)g_splitW, (int32_t)g_splitH);
+    if (r == VK_SUCCESS) GlStage(true, false, (int32_t)g_splitW, (int32_t)g_splitH, true);
     // 3. the copy back, the HUD and the rest, with the game's semaphores and fence
     std::vector<VkCommandBuffer> cmds2 = { B.cmdOut[k], B.cmdHud[k] };
     cmds2.insert(cmds2.end(), b.pCommandBuffers + ci + 1, b.pCommandBuffers + b.commandBufferCount);
@@ -1001,6 +1025,445 @@ static bool SubmitSplit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f
     r_vkQueueSubmit(q, 0, nullptr, B.fenceS[k]);   // signals once all of it is done: the slot can be used again
     if (r == VK_SUCCESS) r = r2;
     if (r != VK_SUCCESS) BridgeFail(Fmt("a split submit failed (%d)", r).c_str());
+    return true;
+}
+
+// ---------------------------------------------------------------- the world drawn again in GL
+// The surest way to put all of FortsGFX on Vulkan is to give its GL renderer the same frame. Every texture the game
+// uploads (vkCmdCopyBufferToImage from a mapped staging buffer) is copied into a GL texture of ours, a mirror,
+// registered under its file name as the GL hooks register an upload. Every draw of a battle frame up to the HUD is kept:
+// its vertices (read from mapped memory as it is recorded), matrix, texture, sampler, blend and primitive. At the split
+// it is drawn again in our GL context through the GL hooks themselves (hk_glBegin, hk_glVertex2f...), in the order the
+// game drew it: the backdrop pass with each layer's matrix as the projection, the playfield with the camera's ortho as
+// the projection and each object's matrix (the camera's inverse times the draw's) as the modelview - as the game draws
+// with GL. So gfx.cpp sees what it sees with GL: masks, light sources, the world's position, the game's smoke and rain
+// to replace, its own effects. Its post chain draws the result, which replaces the Vulkan world under the game's HUD.
+// [Vulkan] Replay=0: only the image stages, on Vulkan's own frame.
+
+extern "C" {   // hooks.cpp: the GL renderer's entry points, as the game calls them
+void WINAPI hk_glBegin(GLenum); void WINAPI hk_glEnd(); void WINAPI hk_glVertex2f(GLfloat, GLfloat);
+void WINAPI hk_glTexCoord2f(GLfloat, GLfloat); void WINAPI hk_glColor4f(GLfloat, GLfloat, GLfloat, GLfloat);
+void WINAPI hk_glEnable(GLenum); void WINAPI hk_glDisable(GLenum); void WINAPI hk_glBlendFunc(GLenum, GLenum);
+void WINAPI hk_glClear(GLbitfield); void WINAPI hk_glClearColor(GLclampf, GLclampf, GLclampf, GLclampf);
+void WINAPI hk_glViewport(GLint, GLint, GLsizei, GLsizei); void WINAPI hk_glMatrixMode(GLenum); void WINAPI hk_glLoadIdentity();
+void WINAPI hk_glLoadMatrixf(const GLfloat*); void WINAPI hk_glOrtho(GLdouble, GLdouble, GLdouble, GLdouble, GLdouble, GLdouble);
+void WINAPI hk_glBindTexture(GLenum, GLuint); void WINAPI hk_glDeleteTextures(GLsizei, const GLuint*);
+void WINAPI hk_glTexEnvf(GLenum, GLenum, GLfloat); void WINAPI hk_glLineWidth(GLfloat);
+}
+enum : GLenum {
+    kGlTexEnv = 0x2300, kGlTexEnvMode = 0x2200, kGlModulate = 0x2100, kGlSrcAlpha = 0x0302, kGlOneMinusSrcAlpha = 0x0303,
+    kGlDepthTest = 0x0B71, kGlCullFace = 0x0B44, kGlWrapS = 0x2802, kGlWrapT = 0x2803, kGlRepeat = 0x2901, kGlClampEdge = 0x812F,
+    kGlMirrored = 0x8370, kGlLinearMipLinear = 0x2703, kGlLinearMipNearest = 0x2701, kGlNearestMipNearest = 0x2700,
+    kGlNearestMipLinear = 0x2702, kGlBaseLevel = 0x813C, kGlMaxLevel = 0x813D, kGlRgba = 0x1908, kGlBgra = 0x80E1,
+    kGlUnsignedByte = 0x1401, kGlUnpackAlignment = 0x0CF5, kGlBptc = 0x8E8C, kGlDxt1 = 0x83F0, kGlDxt1a = 0x83F1,
+    kGlDxt3 = 0x83F2, kGlDxt5 = 0x83F3, kGlRgtc1 = 0x8DBB, kGlRgtc2 = 0x8DBD,
+    kGlR8 = 0x8229, kGlRed = 0x1903, kGlAlpha = 0x1906, kGlSwizzleR = 0x8E42, kGlSwizzleG = 0x8E43, kGlSwizzleB = 0x8E44, kGlSwizzleA = 0x8E45,
+};
+static void (WINAPI* glTexStorage2D_)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+static void (WINAPI* glTexSubImage2D_)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*);
+static void (WINAPI* glCompressedTexSubImage2D_)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLsizei, const void*);
+
+struct Upload { VkImage img; uint32_t mip; int32_t x, y; uint32_t w, h; std::vector<uint8_t> data; };
+struct RDraw {
+    VkImage img; VkSampler sampler;
+    uint8_t frag;              // PipeInfo::frag
+    bool blendOn, additive;
+    VkPrimitiveTopology topo;
+    float m[16];               // the draw's matrix (push constants)
+    float scroll[2];           // fragscrolltex's texture offset
+    float lineWidth;
+    uint32_t first, count;     // in g_rverts, 8 floats a vertex: x y u v r g b a
+    int pass;                  // the rendering pass of the frame it was in
+    VkDescriptorSet ubo;       // verts.spv: where the matrix is (read when drawn again: the game updates it each frame)
+    VkCommandBuffer list;      // an executed secondary command buffer (the terrain): drawn again as a GL display list
+};
+// A secondary command buffer's draws, kept when it is recorded, and the GL display list made of them.
+struct SecList { unsigned version = 0; std::vector<RDraw> draws; std::vector<float> verts; GLuint glList = 0; unsigned glVersion = 0; };
+static std::unordered_map<VkCommandBuffer, SecList> g_secLists;
+static std::vector<Upload> g_uploads;          // texture data from the game's staging buffers, for GL
+static std::vector<GLuint> g_mirrorGone;       // mirrors of images the game destroyed
+static std::unordered_map<VkImage, GLuint> g_mirror;
+static std::vector<RDraw> g_rdraws;            // this frame's draws so far
+static std::vector<float> g_rverts;
+static int g_framePass;                        // rendering passes begun this frame
+static bool g_captureBroken;                   // a draw this frame couldn't be kept: no replay this frame
+static const char* g_brokenWhy;
+static int g_replayOn = -1;
+static unsigned g_mirrorCount, g_replayFrames, g_replayMisses;
+
+static bool ReplayOn() {
+    if (g_replayOn < 0) g_replayOn = IniInt(L"Effects", 1) && IniInt(L"Replay", 1);
+    return g_replayOn && !B.failed;
+}
+
+// Bytes per 4x4 block (block compressed) or per texel; 0: not mirrored.
+static uint32_t TexelBytes(VkFormat f, bool& bc, GLenum& glFmt, GLenum& glData) {
+    bc = true; glData = 0;
+    switch (f) {
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: glFmt = kGlDxt1; return 8;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: glFmt = kGlDxt1a; return 8;
+    case VK_FORMAT_BC2_UNORM_BLOCK: glFmt = kGlDxt3; return 16;
+    case VK_FORMAT_BC3_UNORM_BLOCK: glFmt = kGlDxt5; return 16;
+    case VK_FORMAT_BC4_UNORM_BLOCK: glFmt = kGlRgtc1; return 8;
+    case VK_FORMAT_BC5_UNORM_BLOCK: glFmt = kGlRgtc2; return 16;
+    case VK_FORMAT_BC7_UNORM_BLOCK: glFmt = kGlBptc; return 16;
+    default: break;
+    }
+    bc = false; glFmt = kGlRgba8;
+    if (f == VK_FORMAT_R8G8B8A8_UNORM) { glData = kGlRgba; return 4; }
+    if (f == VK_FORMAT_B8G8R8A8_UNORM) { glData = kGlBgra; return 4; }
+    if (f == VK_FORMAT_R8_UNORM) { glFmt = kGlR8; glData = kGlRed; return 1; }   // font atlases: coverage only
+    return 0;
+}
+
+static void CaptureUpload(VkBuffer b, VkImage im, uint32_t n, const VkBufferImageCopy* r) {   // g_mx held
+    if (!ReplayOn()) return;
+    auto ii = g_imgs.find(im);
+    if (ii == g_imgs.end() || !(ii->second.usage & VK_IMAGE_USAGE_SAMPLED_BIT) || ii->second.name.compare(0, 3, "ui/") == 0) return;
+    bool bc;
+    GLenum fmt, data;
+    uint32_t tb = TexelBytes(ii->second.fmt, bc, fmt, data);
+    if (!tb) return;
+    for (uint32_t i = 0; i < n; i++) {
+        const VkBufferImageCopy& c = r[i];
+        uint32_t w = c.imageExtent.width, h = c.imageExtent.height;
+        if (c.imageSubresource.baseArrayLayer || c.imageSubresource.layerCount != 1) continue;
+        if (c.bufferRowLength && c.bufferRowLength != w) continue;   // not tightly packed: not seen from Forts
+        size_t size = bc ? (size_t)((w + 3) / 4) * ((h + 3) / 4) * tb : (size_t)w * h * tb;
+        const uint8_t* p = BufPtr(b, c.bufferOffset);
+        Upload u = { im, c.imageSubresource.mipLevel, c.imageOffset.x, c.imageOffset.y, w, h, {} };
+        u.data.resize(size);
+        if (!p || !SafeRead(u.data.data(), p, size)) {
+            static bool logged;
+            if (!logged) { logged = true; VkLog("replay: an upload's data could not be read (staging buffer not mapped)"); }
+            continue;
+        }
+        g_uploads.push_back(std::move(u));
+    }
+}
+
+// The uploads since last time, into the mirrors (GL current).
+static void MirrorFlush() {
+    std::vector<Upload> ups;
+    std::vector<GLuint> gone;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        ups.swap(g_uploads);
+        gone.swap(g_mirrorGone);
+    }
+    for (GLuint t : gone) hk_glDeleteTextures(1, &t);   // gfx.cpp forgets them too
+    if (ups.empty()) return;
+    if (!glTexStorage2D_) {
+        glTexStorage2D_ = (decltype(glTexStorage2D_))RealProc("glTexStorage2D");
+        glTexSubImage2D_ = (decltype(glTexSubImage2D_))RealProc("glTexSubImage2D");
+        glCompressedTexSubImage2D_ = (decltype(glCompressedTexSubImage2D_))RealProc("glCompressedTexSubImage2D");
+        if (!glTexStorage2D_ || !glTexSubImage2D_ || !glCompressedTexSubImage2D_) { g_replayOn = 0; VkLog("replay off: GL can't make the textures"); return; }
+    }
+    R.PixelStorei(kGlUnpackAlignment, 1);
+    unsigned made = 0;
+    for (Upload& u : ups) {
+        ImgInfo info;
+        GLuint tex;
+        {
+            std::lock_guard<std::recursive_mutex> lk(g_mx);
+            auto ii = g_imgs.find(u.img);
+            if (ii == g_imgs.end()) continue;   // destroyed meanwhile
+            info = ii->second;
+            tex = g_mirror[u.img];
+        }
+        bool bc;
+        GLenum fmt, data;
+        TexelBytes(info.fmt, bc, fmt, data);
+        if (!tex) {
+            GL.GenTextures(1, &tex);
+            GL.BindTexture(kGlTex2D, tex);
+            glTexStorage2D_(kGlTex2D, (GLsizei)std::max(info.mips, 1u), fmt, (GLsizei)info.w, (GLsizei)info.h);
+            GL.TexParameteri(kGlTex2D, kGlBaseLevel, 0);
+            GL.TexParameteri(kGlTex2D, kGlMaxLevel, (GLint)std::max(info.mips, 1u) - 1);
+            if (fmt == kGlR8) {   // read as white with the coverage in alpha, like the GL renderer's alpha textures
+                GL.TexParameteri(kGlTex2D, kGlSwizzleR, 1); GL.TexParameteri(kGlTex2D, kGlSwizzleG, 1);
+                GL.TexParameteri(kGlTex2D, kGlSwizzleB, 1); GL.TexParameteri(kGlTex2D, kGlSwizzleA, kGlRed);
+            }
+            GfxClassifyTexture(tex, info.name.empty() ? "(generated by game)" : info.name);
+            GfxNoteTextureFormat(tex, (GLint)(fmt == kGlR8 ? kGlAlpha : fmt));
+            GfxNoteTextureSize(tex, (int)info.w, (int)info.h);
+            std::lock_guard<std::recursive_mutex> lk(g_mx);
+            g_mirror[u.img] = tex;
+            made++;
+        } else GL.BindTexture(kGlTex2D, tex);
+        if (bc) glCompressedTexSubImage2D_(kGlTex2D, (GLint)u.mip, u.x, u.y, (GLsizei)u.w, (GLsizei)u.h, fmt, (GLsizei)u.data.size(), u.data.data());
+        else glTexSubImage2D_(kGlTex2D, (GLint)u.mip, u.x, u.y, (GLsizei)u.w, (GLsizei)u.h, data, kGlUnsignedByte, u.data.data());
+    }
+    GL.BindTexture(kGlTex2D, 0);
+    if (GLenum e = GL.GetError()) VkLog("replay: GL error 0x%x making the mirrors", e);
+    g_mirrorCount += made;
+    if (made) VkLog("replay: %u textures mirrored in GL (%u in all), %zu uploads", made, g_mirrorCount, ups.size());
+}
+
+static void CaptureDraw(CmdState& c, VkCommandBuffer cb, uint32_t first, uint32_t count, uint32_t instances) {   // g_mx held
+    if (!ReplayOn()) return;
+    SecList* sl = c.secondary ? &g_secLists[cb] : nullptr;
+    bool& broken = sl ? c.sbroken : g_captureBroken;
+    const char*& why = sl ? c.sWhy : g_brokenWhy;
+    if (broken || (!sl && g_splitDone)) return;
+    std::vector<RDraw>& out = sl ? sl->draws : g_rdraws;
+    std::vector<float>& verts = sl ? sl->verts : g_rverts;
+    auto pi = g_pipes.find(c.pipe);
+    bool fortsVertex = pi != g_pipes.end() && pi->second.stride[0] == 32 && pi->second.attrs.size() == 3 &&
+                       pi->second.attrs[0].offset == 0 && pi->second.attrs[1].offset == 8 && pi->second.attrs[2].offset == 16 &&
+                       pi->second.attrs[2].format == VK_FORMAT_R32G32B32A32_SFLOAT;
+    bool ubo = fortsVertex && pi->second.uboMatrix;
+    if (!fortsVertex || (!ubo && !c.hasVsPush) || (ubo && !c.sets[1]) || !c.vb[0] || instances != 1) {
+        broken = true;
+        why = !fortsVertex ? "a draw without Forts' 32-byte vertex" : (!ubo && !c.hasVsPush) ? "a draw without a matrix" : ubo && !c.sets[1] ? "a draw without its matrix's uniform buffer"
+            : !c.vb[0] ? "a draw without a vertex buffer" : "an instanced draw";
+        return;
+    }
+    RDraw d = {};
+    if (ubo) d.ubo = c.sets[1];
+    d.frag = pi->second.frag;
+    if (d.frag != 1) {
+        auto s = g_sets.find(c.sets[0]);
+        auto b = s != g_sets.end() ? s->second.find(0) : decltype(s->second.end()){};
+        if (s == g_sets.end() || b == s->second.end()) { broken = true; why = "a textured draw without its texture's descriptor"; return; }
+        auto v = g_views.find(b->second.view);
+        if (v == g_views.end()) { broken = true; why = "a texture view not seen made"; return; }
+        d.img = v->second;
+        d.sampler = b->second.sampler;
+    }
+    d.blendOn = pi->second.blendOn;
+    d.additive = pi->second.dst == VK_BLEND_FACTOR_ONE;
+    d.topo = pi->second.topo;
+    memcpy(d.m, c.vsPush, sizeof(d.m));
+    for (const PushRec& p : c.pushes)
+        if ((p.stages & VK_SHADER_STAGE_FRAGMENT_BIT) && p.off == 64 && p.size >= 8) memcpy(d.scroll, p.data, 8);
+    d.lineWidth = c.hasLineWidth ? c.lineWidth : 1.0f;
+    d.pass = g_framePass;
+    const uint8_t* p = BufPtr(c.vb[0], c.vbOff[0] + (VkDeviceSize)first * 32);
+    size_t at = verts.size();
+    verts.resize(at + (size_t)count * 8);
+    if (!p || !SafeRead(&verts[at], p, (size_t)count * 32)) { verts.resize(at); broken = true; why = "vertices not readable (buffer not mapped)"; return; }
+    d.first = (uint32_t)(at / 8);
+    d.count = count;
+    out.push_back(d);
+}
+
+// The game executes secondary command buffers (recorded once: the terrain) in a frame's pass: each goes into the
+// frame's draws as one display list, at its place.
+static void CaptureExecute(uint32_t n, const VkCommandBuffer* cbs) {   // g_mx held
+    if (!ReplayOn() || g_splitDone || g_captureBroken) return;
+    for (uint32_t i = 0; i < n; i++) {
+        auto c = g_cmds.find(cbs[i]);
+        auto s = g_secLists.find(cbs[i]);
+        if (c == g_cmds.end() || !c->second.secondary || c->second.sbroken || s == g_secLists.end()) {
+            g_captureBroken = true;
+            g_brokenWhy = c != g_cmds.end() && c->second.sWhy ? c->second.sWhy : "a secondary command buffer that wasn't kept";
+            return;
+        }
+        s->second.version = c->second.version;
+        if (s->second.draws.empty()) continue;
+        RDraw d = {};
+        d.list = cbs[i];
+        d.pass = g_framePass;
+        d.ubo = s->second.draws[0].ubo;
+        memcpy(d.m, s->second.draws[0].m, sizeof(d.m));
+        d.img = s->second.draws[0].img;
+        d.sampler = s->second.draws[0].sampler;
+        d.frag = s->second.draws[0].frag;
+        d.blendOn = s->second.draws[0].blendOn;
+        d.additive = s->second.draws[0].additive;
+        g_rdraws.push_back(d);
+    }
+}
+
+static bool UboMatrix(VkDescriptorSet set, float* m) {   // the matrix a verts.spv draw is drawn with, as the uniform buffer holds it now
+    std::lock_guard<std::recursive_mutex> lk(g_mx);
+    auto s = g_setBufs.find(set);
+    if (s == g_setBufs.end()) return false;
+    auto b = s->second.find(0);
+    if (b == s->second.end()) return false;
+    const uint8_t* p = BufPtr(b->second.buf, b->second.off);
+    return p && SafeRead(m, p, 64);
+}
+
+static void ApplySampler(VkSampler s) {   // the draw's filtering and wrapping, on its mirror (bound)
+    SamplerInfo si = { VK_FILTER_LINEAR, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT };
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        auto it = g_samplers.find(s);
+        if (it != g_samplers.end()) si = it->second;
+    }
+    auto wrap = [](VkSamplerAddressMode m) -> GLint {
+        return m == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE || m == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ? kGlClampEdge
+             : m == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT ? kGlMirrored : kGlRepeat;
+    };
+    bool lin = si.min == VK_FILTER_LINEAR, mipLin = si.mip == VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    GL.TexParameteri(kGlTex2D, kGlWrapS, wrap(si.u));
+    GL.TexParameteri(kGlTex2D, kGlWrapT, wrap(si.v));
+    GL.TexParameteri(kGlTex2D, kGlMinFilter, lin ? (mipLin ? kGlLinearMipLinear : kGlLinearMipNearest) : (mipLin ? kGlNearestMipLinear : kGlNearestMipNearest));
+    GL.TexParameteri(kGlTex2D, kGlMagFilter, si.mag == VK_FILTER_LINEAR ? kGlLinear : kGlNearest);
+}
+
+static void Ortho(const float* m) {   // the projection: an ortho as the game's GL renderer sets it (gfx.cpp reads the world from it)
+    if (fabsf(m[1]) + fabsf(m[4]) > 1e-9f || m[0] == 0.0f || m[5] == 0.0f || m[10] == 0.0f) { hk_glLoadMatrixf(m); return; }
+    double l = (-1.0 - m[12]) / m[0], r = (1.0 - m[12]) / m[0], b = (-1.0 - m[13]) / m[5], t = (1.0 - m[13]) / m[5];
+    double fn = -2.0 / m[10], sum = -m[14] * fn;   // far - near, far + near
+    hk_glOrtho(l, r, b, t, (sum - fn) / 2.0, (sum + fn) / 2.0);
+}
+
+static GLuint (WINAPI* glGenLists_)(GLsizei);
+extern "C" { void WINAPI hk_glNewList(GLuint, GLenum); void WINAPI hk_glEndList(); void WINAPI hk_glCallList(GLuint); }
+
+// One draw's texture, blend and vertices, through the GL hooks (also while a display list is compiled).
+static void EmitDraw(const RDraw& d, const float* v, GLuint tex) {
+    if (tex) {
+        hk_glEnable(kGlTex2D);
+        hk_glBindTexture(kGlTex2D, tex);
+        ApplySampler(d.sampler);
+    } else hk_glDisable(kGlTex2D);
+    if (d.blendOn) { hk_glEnable(GL_BLEND); hk_glBlendFunc(kGlSrcAlpha, d.additive ? (GLenum)1 : (GLenum)kGlOneMinusSrcAlpha); }
+    else hk_glDisable(GL_BLEND);
+    uint32_t n = d.count;
+    float su = d.frag == 2 ? d.scroll[0] : 0.0f, sv = d.frag == 2 ? d.scroll[1] : 0.0f;
+    auto vtx = [&](uint32_t k) {
+        const float* p = v + (size_t)k * 8;
+        hk_glTexCoord2f(p[2] + su, p[3] + sv);
+        hk_glColor4f(p[4], p[5], p[6], p[7]);
+        hk_glVertex2f(p[0], p[1]);
+    };
+    // The game's particles are quads, which Vulkan gets as two triangles each (q0 q1 q2, q1 q3 q2): as quads again,
+    // gfx.cpp tells them apart as it does with GL.
+    bool quads = d.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && n >= 6 && n % 6 == 0;
+    for (uint32_t k = 0; quads && k < n; k += 6)
+        quads = !memcmp(v + (k + 3) * 8, v + (k + 1) * 8, 4 * sizeof(float)) && !memcmp(v + (k + 5) * 8, v + (k + 2) * 8, 4 * sizeof(float));
+    if (d.topo == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || d.topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) hk_glLineWidth(d.lineWidth);
+    if (quads) {
+        hk_glBegin(0x0007);   // GL_QUADS
+        for (uint32_t k = 0; k < n; k += 6) { vtx(k); vtx(k + 1); vtx(k + 4); vtx(k + 2); }
+    } else {
+        static const GLenum modes[] = { 0x0000, 0x0001, 0x0003, 0x0004, 0x0005, 0x0006 };   // points .. triangle fan
+        hk_glBegin((unsigned)d.topo < 6 ? modes[d.topo] : 0x0004);
+        for (uint32_t k = 0; k < n; k++) vtx(k);
+    }
+    hk_glEnd();
+}
+
+static GLuint MirrorOf(VkImage img) {   // g_mx held
+    auto m = g_mirror.find(img);
+    return m == g_mirror.end() ? 0 : m->second;
+}
+
+// The kept draws, through gfx.cpp's world pass into OUT. False: not possible this frame (OUT untouched).
+static bool Replay(int32_t w, int32_t h) {
+    std::vector<RDraw> draws;
+    std::vector<float> verts;
+    bool broken;
+    const char* brokenWhy;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        draws.swap(g_rdraws);
+        verts.swap(g_rverts);
+        broken = g_captureBroken;
+        brokenWhy = g_brokenWhy;
+    }
+    auto skip = [](const char* why) { if (g_replayMisses++ < 8) VkLog("replay: not this frame - %s; Vulkan's own frame gets the image stages", why); return false; };
+    if (broken) return skip(brokenWhy ? brokenWhy : "a draw could not be kept");
+    if (draws.empty()) return skip("no draws kept before the HUD");
+    // matrices from uniform buffers as they are now; the textures' mirrors; the display lists' own draws
+    std::vector<GLuint> tex(draws.size(), 0);
+    std::unordered_map<VkCommandBuffer, SecList> lists;
+    for (RDraw& d : draws)
+        if (d.ubo && !UboMatrix(d.ubo, d.m)) return skip("a matrix's uniform buffer is not readable");
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        auto missing = [&](VkImage img) {
+            if (g_replayMisses++ < 8) VkLog("replay: not this frame - no mirror of %s", g_imgs.count(img) ? ImgDesc(img).c_str() : "an image");
+            return false;
+        };
+        for (size_t i = 0; i < draws.size(); i++) {
+            if (draws[i].list) {
+                SecList& sl = g_secLists[draws[i].list];
+                for (const RDraw& s : sl.draws) if (s.frag != 1 && !MirrorOf(s.img)) return missing(s.img);
+                if (sl.glVersion != sl.version || !sl.glList) lists[draws[i].list] = sl;   // to compile
+            }
+            if (draws[i].frag != 1 && !(tex[i] = MirrorOf(draws[i].img))) return missing(draws[i].img);
+        }
+    }
+    // the camera: the matrix the playfield's world-space struts are drawn with
+    int backPass = draws[0].pass;
+    const float* cam = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        for (const RDraw& d : draws) {
+            if (d.pass == backPass || d.list || d.frag == 1) continue;
+            auto ii = g_imgs.find(d.img);
+            if (ii != g_imgs.end() && ii->second.name.find("materials/") != std::string::npos) { cam = d.m; break; }
+        }
+    }
+    if (!cam) return skip("no struts (materials/) drawn after the backdrop pass to place the world by");
+    float inv[16] = { 1 / cam[0], 0, 0, 0, 0, 1 / cam[5], 0, 0, 0, 0, 1 / cam[10], 0, -cam[12] / cam[0], -cam[13] / cam[5], -cam[14] / cam[10], 1 };
+    auto objectMatrix = [&](const float* m, float* mv) {   // the camera's inverse x the draw's
+        for (int c = 0; c < 4; c++)
+            for (int r = 0; r < 4; r++) {
+                float s = 0;
+                for (int k = 0; k < 4; k++) s += inv[k * 4 + r] * m[c * 4 + k];
+                mv[c * 4 + r] = s;
+            }
+    };
+    if (!GfxBridgeBegin(w, h)) return false;   // FortsGFX off (F9)
+    // display lists made from secondary command buffers recorded since last time
+    if (!lists.empty()) {
+        if (!glGenLists_) glGenLists_ = (decltype(glGenLists_))RealProc("glGenLists");
+        for (auto& kv : lists) {
+            SecList& sl = kv.second;
+            if (!sl.glList) sl.glList = glGenLists_ ? glGenLists_(1) : 0;
+            if (!sl.glList) continue;
+            hk_glNewList(sl.glList, 0x1300);   // GL_COMPILE: the hooks keep its vertices (the terrain's shape)
+            for (const RDraw& s : sl.draws) {
+                GLuint t;
+                { std::lock_guard<std::recursive_mutex> lk(g_mx); t = s.frag == 1 ? 0 : MirrorOf(s.img); }
+                EmitDraw(s, &sl.verts[(size_t)s.first * 8], t);
+            }
+            hk_glEndList();
+            std::lock_guard<std::recursive_mutex> lk(g_mx);
+            SecList& live = g_secLists[kv.first];
+            live.glList = sl.glList;
+            live.glVersion = sl.version;
+        }
+    }
+    hk_glViewport(0, 0, w, h);
+    hk_glClearColor(0, 0, 0, 0);
+    hk_glClear(kGlColorBit);
+    hk_glDisable(kGlDepthTest);
+    hk_glDisable(kGlCullFace);
+    hk_glDisable(kGlScissorTest);
+    hk_glTexEnvf(kGlTexEnv, kGlTexEnvMode, (GLfloat)kGlModulate);
+    unsigned listsDrawn = 0;
+    for (size_t i = 0; i < draws.size(); i++) {
+        const RDraw& d = draws[i];
+        bool back = d.pass == backPass && !d.list;
+        hk_glMatrixMode(GL_PROJECTION);
+        hk_glLoadIdentity();
+        Ortho(back ? d.m : cam);
+        hk_glMatrixMode(GL_MODELVIEW);
+        if (back) hk_glLoadIdentity();
+        else { float mv[16]; objectMatrix(d.m, mv); hk_glLoadMatrixf(mv); }
+        if (d.list) {   // as the GL renderer draws terrain: a display list, with its first texture bound
+            GLuint gl;
+            { std::lock_guard<std::recursive_mutex> lk(g_mx); gl = g_secLists[d.list].glList; }
+            if (!gl) continue;
+            if (tex[i]) { hk_glEnable(kGlTex2D); hk_glBindTexture(kGlTex2D, tex[i]); } else hk_glDisable(kGlTex2D);
+            hk_glCallList(gl);
+            listsDrawn++;
+            continue;
+        }
+        EmitDraw(d, &verts[(size_t)d.first * 8], tex[i]);
+    }
+    hk_glDisable(GL_BLEND);
+    GfxBridgeEnd(B.glFbo[1]);
+    if (++g_replayFrames == 1)
+        VkLog("replay: first frame drawn again in GL (%zu draws, %u of them display lists from secondary command buffers, %zu vertices)",
+              draws.size(), listsDrawn, verts.size() / 8);
     return true;
 }
 
@@ -1263,6 +1726,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPr
     else if (dumped) VkLog("no screenshot of that frame");
     g_worldSeen = g_splitDone = false;   // the next frame
     g_frameDraws = 0;
+    g_rdraws.clear();
+    g_rverts.clear();
+    g_captureBroken = false;
+    g_brokenWhy = nullptr;
+    g_framePass = 0;
+    bool mirror = !g_uploads.empty() && ReplayOn();
+    lk.unlock();
+    if (mirror && BridgeGlContext()) { GlCurrent cur; MirrorFlush(); }   // textures loaded in menus and loading screens
+    lk.lock();
 
     static bool keyPrev;
     DWORD pid = 0;
@@ -1414,10 +1886,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateGraphicsPipelines(VkDevice d, V
         const VkGraphicsPipelineCreateInfo& p = ci[i];
         PipeInfo pi = {};
         pi.id = Id(kPipe, out[i]);
+        pi.frag = 3;
         for (uint32_t s = 0; s < p.stageCount; s++) {
             auto sh = g_shaders.find(p.pStages[s].module);
             pi.shaders += Fmt("%s%s %s", s ? " + " : "", p.pStages[s].stage == VK_SHADER_STAGE_VERTEX_BIT ? "vs" : p.pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? "fs" : "stage",
                               sh != g_shaders.end() ? sh->second.c_str() : "?");
+            if (p.pStages[s].stage == VK_SHADER_STAGE_VERTEX_BIT && sh != g_shaders.end()) pi.uboMatrix = sh->second == "verts.spv";
+            if (p.pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT && sh != g_shaders.end())
+                pi.frag = sh->second == "frag.spv" ? 0 : sh->second == "colourfrag.spv" ? 1 : sh->second == "fragscrolltex.spv" ? 2 : 3;
         }
         std::string attrs;
         if (const VkPipelineVertexInputStateCreateInfo* vi = p.pVertexInputState) {
@@ -1433,6 +1909,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateGraphicsPipelines(VkDevice d, V
         pi.blend = "none";
         if (p.pColorBlendState && p.pColorBlendState->attachmentCount) {
             const VkPipelineColorBlendAttachmentState& b = p.pColorBlendState->pAttachments[0];
+            pi.blendOn = b.blendEnable != VK_FALSE;
+            pi.src = b.srcColorBlendFactor;
+            pi.dst = b.dstColorBlendFactor;
             pi.blend = b.blendEnable ? Fmt("%s/%s op %d, alpha %s/%s", BlendName(b.srcColorBlendFactor), BlendName(b.dstColorBlendFactor),
                                            (int)b.colorBlendOp, BlendName(b.srcAlphaBlendFactor), BlendName(b.dstAlphaBlendFactor))
                                      : std::string("off");
@@ -1465,9 +1944,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateImage(VkDevice d, const VkImage
     if (r != VK_SUCCESS) return r;
     std::lock_guard<std::recursive_mutex> lk(g_mx);
     ImgInfo ii = { Id(kImg, *out), ci->format, ci->extent.width, ci->extent.height, ci->mipLevels, ci->usage, HookFreshImageName() };
+    static std::string testName = Narrow([] { wchar_t b[64] = L""; GetPrivateProfileStringW(L"Vulkan", L"TestName", L"", b, 64, (g_gameDir + L"FortsGFX.ini").c_str()); return std::wstring(b); }().c_str());
+    if (ii.name.empty() && !testName.empty() && (ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) ii.name = Fmt("%stest%d.tga", testName.c_str(), ii.id);   // tools/vktest
     LoadLog("VKIMG img#%d %ux%u %s mips %u layers %u usage %s%s%s", ii.id, ii.w, ii.h, FormatName(ii.fmt).c_str(), ii.mips,
             ci->arrayLayers, UsageName(ii.usage).c_str(), ii.name.empty() ? "" : " <- ", ii.name.c_str());
     g_imgs[*out] = ii;
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL hk_vkDestroyImage(VkDevice d, VkImage im, const VkAllocationCallbacks* a) {
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        auto m = g_mirror.find(im);
+        if (m != g_mirror.end()) { g_mirrorGone.push_back(m->second); g_mirror.erase(m); }
+        g_uploads.erase(std::remove_if(g_uploads.begin(), g_uploads.end(), [im](const Upload& u) { return u.img == im; }), g_uploads.end());
+        g_imgs.erase(im);   // a later image may get the same handle
+    }
+    r_vkDestroyImage(d, im, a);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateSampler(VkDevice d, const VkSamplerCreateInfo* ci, const VkAllocationCallbacks* a, VkSampler* out) {
+    VkResult r = r_vkCreateSampler(d, ci, a, out);
+    if (r != VK_SUCCESS) return r;
+    std::lock_guard<std::recursive_mutex> lk(g_mx);
+    g_samplers[*out] = { ci->magFilter, ci->minFilter, ci->mipmapMode, ci->addressModeU, ci->addressModeV };
+    VkLog("sampler: mag %d min %d mip %d, address %d/%d", (int)ci->magFilter, (int)ci->minFilter, (int)ci->mipmapMode, (int)ci->addressModeU, (int)ci->addressModeV);
     return r;
 }
 
@@ -1523,7 +2024,10 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkUpdateDescriptorSets(VkDevice d, uint32_t
         static bool logged;
         for (uint32_t i = 0; i < nw; i++) {
             if ((w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) && w[i].pImageInfo)
-                for (uint32_t j = 0; j < w[i].descriptorCount; j++) g_sets[w[i].dstSet][w[i].dstBinding + j] = w[i].pImageInfo[j].imageView;
+                for (uint32_t j = 0; j < w[i].descriptorCount; j++) g_sets[w[i].dstSet][w[i].dstBinding + j] = { w[i].pImageInfo[j].imageView, w[i].pImageInfo[j].sampler };
+            if ((w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || w[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) && w[i].pBufferInfo)
+                for (uint32_t j = 0; j < w[i].descriptorCount; j++)
+                    g_setBufs[w[i].dstSet][w[i].dstBinding + j] = { w[i].pBufferInfo[j].buffer, w[i].pBufferInfo[j].offset, w[i].pBufferInfo[j].range };
             if (!logged && w[i].descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
                 logged = true;
                 VkLog("descriptor writes also of type %d (binding %u)", (int)w[i].descriptorType, w[i].dstBinding);
@@ -1543,12 +2047,36 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkUpdateDescriptorSetWithTemplate(VkDevice 
 #define LOCK std::lock_guard<std::recursive_mutex> lk(g_mx)
 // Every command goes to Redir(cb): the game's command buffer, or our cmdHud once a split has happened in it.
 
+static VKAPI_ATTR VkResult VKAPI_CALL hk_vkAllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo* ai, VkCommandBuffer* out) {
+    VkResult r = r_vkAllocateCommandBuffers(d, ai, out);
+    if (r != VK_SUCCESS) return r;
+    LOCK;
+    for (uint32_t i = 0; i < ai->commandBufferCount; i++) g_cmdSecondary[out[i]] = ai->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+    if (ai->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+        static bool logged;
+        if (!logged) { logged = true; VkLog("the game makes secondary command buffers (recorded once, executed from frames)"); }
+    }
+    return r;
+}
+static VKAPI_ATTR void VKAPI_CALL hk_vkFreeCommandBuffers(VkDevice d, VkCommandPool pool, uint32_t n, const VkCommandBuffer* cbs) {
+    {
+        LOCK;
+        for (uint32_t i = 0; i < n; i++) { g_cmdSecondary.erase(cbs[i]); g_secLists.erase(cbs[i]); g_cmds.erase(cbs[i]); }
+    }
+    r_vkFreeCommandBuffers(d, pool, n, cbs);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL hk_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo* bi) {
     {
         LOCK;
         CmdState& c = g_cmds[cb];
         if (c.splitSlot >= 0) g_redirects--;   // recorded again before it was submitted: that split is dropped
+        static unsigned versions;
         c = CmdState();
+        auto sec = g_cmdSecondary.find(cb);
+        c.secondary = sec != g_cmdSecondary.end() && sec->second;
+        c.version = ++versions;
+        if (c.secondary) { SecList& sl = g_secLists[cb]; sl.draws.clear(); sl.verts.clear(); sl.version = c.version; }
         g_frame.cmdBegins++;
         if (g_dumpRec) DL(cb, Fmt("BEGIN cmd#%d flags 0x%x", Id(kCmd, cb), bi->flags));
     }
@@ -1591,6 +2119,7 @@ static void BeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri, PFN_vk
     {
         LOCK;
         g_frame.rendering++;
+        if (!g_splitDone) g_framePass++;
         CmdState& c = g_cmds[cb];   // kept for a split: the pass begun again on the same attachments
         c.rendering = true;
         c.ri = *ri;
@@ -1650,7 +2179,7 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindDescriptorSets(VkCommandBuffer cb,
                 s += Fmt("%sset%u=set#%d {", i ? " " : "", first + i, Id(kSet, sets[i]));
                 auto it = g_sets.find(sets[i]);
                 if (it != g_sets.end())
-                    for (auto& b : it->second) s += Fmt(" b%u: %s", b.first, ViewDesc(b.second).c_str());
+                    for (auto& b : it->second) s += Fmt(" b%u: %s", b.first, ViewDesc(b.second.view).c_str());
                 s += " }";
             }
             for (uint32_t i = 0; i < nd; i++) s += Fmt("%s%u", i ? "," : " dynamic offsets ", dyn[i]);
@@ -1734,6 +2263,7 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdDraw(VkCommandBuffer cb, uint32_t vc, 
             DL(cb, Fmt("DRAW %u vertices from %u x%u%s", vc, fv, ic, Vertices(c, idx, n).c_str()));
         }
         MaybeSplit(cb, c);
+        if (!c.redirect) CaptureDraw(c, cb, fv, vc, ic);
         drop = c.redirect && GfxLabState().hideHud;
     }
     if (!drop) r_vkCmdDraw(Redir(cb), vc, ic, fv, fi);
@@ -1759,6 +2289,7 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdDrawIndexed(VkCommandBuffer cb, uint32
             DL(cb, Fmt("DRAW INDEXED %u indices from %u, vertex offset %d x%u%s", ic, fidx, voff, inst, Vertices(c, idx, n).c_str()));
         }
         MaybeSplit(cb, c);
+        if (!c.redirect && !g_splitDone) { g_captureBroken = true; g_brokenWhy = "an indexed draw"; }   // Forts draws nothing indexed
         drop = c.redirect && GfxLabState().hideHud;
     }
     if (!drop) r_vkCmdDrawIndexed(Redir(cb), ic, inst, fidx, voff, fi);
@@ -1788,6 +2319,7 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, 
     {
         LOCK;
         g_frame.uploads++;
+        CaptureUpload(b, im, n, r);
         if (g_dumpRec && n)
             DL(cb, Fmt("UPLOAD buf#%d -> %s, %u regions (first %ux%u at %d,%d mip %u)", Id(kBuf, b), ImgDesc(im).c_str(), n, r[0].imageExtent.width,
                        r[0].imageExtent.height, r[0].imageOffset.x, r[0].imageOffset.y, r[0].imageSubresource.mipLevel));
@@ -1827,7 +2359,7 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBuffer(VkCommandBuffer cb, VkBuffe
     r_vkCmdCopyBuffer(Redir(cb), s, d, n, r);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer* cbs) {
-    { LOCK; if (g_dumpRec) DL(cb, Fmt("EXECUTE %u secondary command buffers", n)); }
+    { LOCK; if (g_dumpRec) DL(cb, Fmt("EXECUTE %u secondary command buffers", n)); if (!g_cmds[cb].redirect) CaptureExecute(n, cbs); }
     r_vkCmdExecuteCommands(Redir(cb), n, cbs);
 }
 #undef LOCK
@@ -1845,10 +2377,10 @@ static const Hook kHooks[] = {
     HK(vkQueueSubmit), HK(vkQueueSubmit2), HK(vkQueueSubmit2KHR),
     HK(vkCreateRenderPass), HK(vkCreateRenderPass2), HK(vkCreateRenderPass2KHR), HK(vkCreateFramebuffer),
     HK(vkCreateShaderModule), HK(vkCreatePipelineLayout), HK(vkCreateDescriptorSetLayout), HK(vkCreateGraphicsPipelines),
-    HK(vkCreateImage), HK(vkCreateImageView), HK(vkCreateBuffer),
+    HK(vkCreateImage), HK(vkDestroyImage), HK(vkCreateSampler), HK(vkCreateImageView), HK(vkCreateBuffer),
     HK(vkBindBufferMemory), HK(vkBindBufferMemory2), HK(vkBindBufferMemory2KHR), HK(vkMapMemory), HK(vkUnmapMemory),
     HK(vkUpdateDescriptorSets), HK(vkUpdateDescriptorSetWithTemplate),
-    HK(vkBeginCommandBuffer), HK(vkEndCommandBuffer), HK(vkCmdBeginRenderPass), HK(vkCmdEndRenderPass),
+    HK(vkBeginCommandBuffer), HK(vkEndCommandBuffer), HK(vkAllocateCommandBuffers), HK(vkFreeCommandBuffers), HK(vkCmdBeginRenderPass), HK(vkCmdEndRenderPass),
     HK(vkCmdBeginRendering), HK(vkCmdBeginRenderingKHR), HK(vkCmdEndRendering), HK(vkCmdEndRenderingKHR),
     HK(vkCmdBindPipeline), HK(vkCmdBindDescriptorSets), HK(vkCmdBindVertexBuffers), HK(vkCmdBindIndexBuffer),
     HK(vkCmdPushConstants), HK(vkCmdPushDescriptorSetKHR), HK(vkCmdDraw), HK(vkCmdDrawIndexed),

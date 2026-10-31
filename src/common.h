@@ -221,6 +221,8 @@ void CapSaveRgbaPng(const std::wstring& path, int w, int h, std::vector<uint8_t>
 void CapBridgePhoto(GLuint fbo);             // Vulkan: photo mode's save, from the bridge's shared frame
 
 bool GfxBridgeFrame(GLuint inTex, GLuint outFbo, int w, int h);   // Vulkan: FortsGFX's image stages on a shared frame
+bool GfxBridgeBegin(int w, int h);   // Vulkan, the world drawn again in GL: the world pass begins (false: off)
+void GfxBridgeEnd(GLuint outFbo);    // ... and ends with the post chain into outFbo
 
 // ---- vulkan.cpp ----
 void VkInstallHooks();               // Forts' Vulkan renderer: watch it (GetProcAddress in Forts.exe's imports)

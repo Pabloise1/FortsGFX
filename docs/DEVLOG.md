@@ -6,6 +6,35 @@ A proxy `opengl32.dll` for Forts. Windows loads it from the game folder instead 
 system one; it forwards every OpenGL call to the real `C:\Windows\System32\opengl32.dll`
 and adds a graphics layer on top.
 
+## Vulkan, phase V2 — all of FortsGFX: the world drawn again in GL
+
+Rather than port the renderer, its GL path is given the same frame (`vulkan.cpp`, "the world drawn again in GL"):
+- **Mirrors.** Every texture upload (`vkCmdCopyBufferToImage` from a mapped staging buffer; BC1-7, RGBA8, BGRA8,
+  R8 font atlases) is copied at record time and turned into a GL texture of ours at the next GL step (`MirrorFlush`,
+  `glTexStorage2D` + sub-images, mip by mip), registered like a GL upload (`GfxClassifyTexture` with the DevIL file
+  name, format, size). Destroyed images drop theirs. `ui/` textures aren't mirrored (the HUD stays Vulkan's). ~1.6 GB
+  of textures in a session, so GL holds a second copy (`[Vulkan] Replay=0` avoids it).
+- **Draws.** Each draw up to the HUD split is kept with its vertices (copied from the mapped vertex buffer), matrix
+  (push constants, or the uniform buffer at set 1 for `verts.spv`, read when drawn again), texture, sampler, blend,
+  fragment shader kind (texture x colour / colour / scrolled texture) and primitive. Secondary command buffers - Forts
+  records terrain once into them and executes them in their own passes, its GL display lists - keep their draws when
+  recorded; `vkCmdExecuteCommands` puts them in the frame's list.
+- **Replay** at the split, in our GL context, through the GL hooks themselves (`hk_glBegin`, `hk_glVertex2f`,
+  `hk_glOrtho`, `hk_glLoadMatrixf`, `hk_glCallList`...) between `GfxBridgeBegin` and `GfxBridgeEnd`: the first pass
+  (the backdrop) with each layer's matrix as an ortho projection, everything after with the camera (the matrix of the
+  first `materials/` draw) as the projection and the camera's inverse times the draw's matrix as the modelview; the
+  secondary command buffers become real GL display lists (compiled once per recording), so the hooks keep the terrain's
+  shape and gfx.cpp treats it as terrain; particle batches (two triangles per quad) go back to `GL_QUADS`. gfx.cpp then
+  has what it has with GL: masks, light sources, `g_world`, the backdrop to replace, the game's smoke and rain to hide,
+  terrain for snow - and its whole post chain draws OUT, which goes under the game's HUD.
+- A frame it can't draw again (a draw without a texture's mirror, an indexed or instanced draw, unreadable memory...)
+  gets the image stages on Vulkan's own frame, and vulkan.log says why (the first few times).
+
+`vktest replay` (with Forts' shaders copied to `build\data\shaders` and `[Vulkan] TestSplitAt=3`, `TestName=materials/`
+naming its textures like struts): a textured backdrop pass, the ground as a secondary command buffer with its matrix in
+a uniform buffer, struts in world units, then the HUD - the 3D backdrop replaces the backdrop, the struts get the
+materials, the yellow HUD stays exact, and with Thick snow the snow settles on the beam and the ground but not under it.
+
 ## Vulkan, phase V1b — FortsGFX under the HUD
 
 From the first Vulkan session's dumps (a 4K battle, `vk_frame_03`): Forts records a frame as several one-time

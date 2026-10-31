@@ -5303,6 +5303,41 @@ bool GfxBridgeFrame(GLuint inTex, GLuint outFbo, int w, int h) {
     return true;
 }
 
+// The other Vulkan mode: vulkan.cpp draws the frame's world again in its GL context, through the same hooks the game's
+// GL renderer goes through, between these two - so everything runs as with GL. Begin starts the world pass on the
+// world targets (false: FortsGFX off or can't run); End runs the post chain into `outFbo`.
+bool GfxBridgeBegin(int w, int h) {
+    if (!g_procsLoaded) {
+        g_procsLoaded = true;
+        LoadConfig();
+        if (!LoadProcs()) { g_failed = true; SessionLog("gfx: required GL entry points missing - disabled"); }
+    }
+    PerfFrame();
+    g_frameNo++;
+    g_postRan = g_debugRan = g_projHud = g_playfield = g_worldBound = false;
+    g_drawSeq = 0;
+    g_phase = kOff;
+    PollKeys();
+    if (g_failed || !cfg.enabled || w <= 0 || h <= 0) return false;
+    if (!g_ready || w != g_w || h != g_h || cfg.giScale != g_giScaleBuilt) {
+        if (!CreateResources(w, h)) { g_failed = true; return false; }
+    }
+    G.BindFramebuffer(GL_FRAMEBUFFER, g_worldFbo);
+    ClearMasks();
+    BackdropFrameBegin();
+    g_phase = kWorld;
+    return true;
+}
+void GfxBridgeEnd(GLuint outFbo) {
+    if (g_phase == kWorld) {
+        g_outFbo = outFbo;
+        RunPost();
+        g_outFbo = 0;
+    }
+    if (g_hudMasked) { G.ColorMaski(0, 1, 1, 1, 1); g_hudMasked = false; }
+    g_phase = kOff;
+}
+
 // ---------------------------------------------------------------- offline replay (tools/replay.cpp)
 
 bool GfxReplaySetup(int w, int h) {
