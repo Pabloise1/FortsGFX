@@ -187,7 +187,8 @@ bool GfxHudMasked();                // hooks: the HUD is hidden, ignore the game
 
 // ---- overlay.cpp ----
 void OverlayFrame();                // just before SwapBuffers, after the capture read-back
-void OverlayBridgeFrame(HWND wnd, GLuint fbo);   // Vulkan: the panel over the shared frame, input from wnd
+bool OverlayBridgeUpdate(HWND wnd);  // Vulkan, every present: keys etc. (input from wnd); true = something to draw
+void OverlayBridgeDraw(GLuint fbo);  // ... then the panel over the bridge's shared frame
 void OverlayToast(const char* text);             // a message at the bottom of the screen for a moment
 bool OverlayKeyBlocked(int vk);     // a hotkey is being bound in the panel, or vk was just bound: no hotkey fires
 typedef HRESULT (WINAPI* DI8CreateFn)(HINSTANCE, DWORD, const IID&, void**, void*);

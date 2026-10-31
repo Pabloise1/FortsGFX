@@ -1298,12 +1298,13 @@ static bool KeyEdge(int vk, bool focused, bool& prev) {
     return edge;
 }
 
-void OverlayFrame() {
+// Every frame, nothing drawn: the keys, the tour, look cycling. True when there is something to draw.
+static bool OverlayUpdate() {
     GfxStats st = GfxGetStats();
     g_frameHist[g_histPos] = st.frameMs;
     g_gpuHist[g_histPos] = st.gpuMs;
     g_histPos = (g_histPos + 1) % kHist;
-    if (g_failed) return;
+    if (g_failed) return false;
 
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
@@ -1339,8 +1340,10 @@ void OverlayFrame() {
         if (chapter < 0 || chapter >= kTourSteps) TourStop();
         else { if (!g_tour) TourStart(true); TourEnter(chapter); }
     }
-    bool need = g_open || g_labOpen || g_photo || g_tour || g_cycle || GfxLabState().wipe >= 0 || NowS() - g_toastT < 2.5;
-    if (!need) return;
+    return g_open || g_labOpen || g_photo || g_tour || g_cycle || GfxLabState().wipe >= 0 || NowS() - g_toastT < 2.5;
+}
+
+static void OverlayDraw() {
     if (!g_init) {
         if (!Init()) { g_failed = true; g_open = false; return; }
         g_init = true;
@@ -1368,14 +1371,22 @@ void OverlayFrame() {
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }
 
-// Forts' Vulkan renderer (vulkan.cpp): the panel draws into the shared frame `fbo` of our own GL context, and its
-// input comes from `wnd`, the window Vulkan presents to.
+void OverlayFrame() {
+    if (OverlayUpdate()) OverlayDraw();
+}
+
 void OverlayToast(const char* text) { Toast("%s", text); }
 
-void OverlayBridgeFrame(HWND wnd, GLuint fbo) {
+// Forts' Vulkan renderer (vulkan.cpp): every present updates the keys, input coming from `wnd`, the window Vulkan
+// presents to; only when that says there is something to draw does the panel draw into `fbo`, the shared frame of the
+// bridge's GL context.
+bool OverlayBridgeUpdate(HWND wnd) {
     g_bridgeWnd = wnd;
+    return OverlayUpdate();
+}
+void OverlayBridgeDraw(GLuint fbo) {
     g_targetFbo = fbo;
-    OverlayFrame();
+    OverlayDraw();
     g_targetFbo = 0;
 }
 

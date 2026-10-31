@@ -126,6 +126,7 @@ struct MapInfo { uint8_t* ptr; VkDeviceSize off; };
 struct PipeInfo { int id; std::string shaders, blend; VkPrimitiveTopology topo; uint32_t stride[4]; std::vector<VkVertexInputAttributeDescription> attrs; };
 struct FbInfo { std::vector<VkImageView> views; uint32_t w, h; };
 struct SwapInfo { VkFormat fmt; uint32_t w, h; bool copyable, writable; HWND wnd; std::vector<VkImage> images; };
+struct PushRec { VkPipelineLayout layout; VkShaderStageFlags stages; uint32_t off, size; uint8_t data[128]; };
 struct CmdState {
     VkPipeline pipe = VK_NULL_HANDLE;
     VkBuffer vb[4] = {};
@@ -134,6 +135,20 @@ struct CmdState {
     VkDeviceSize ibOff = 0;
     VkIndexType ibType = VK_INDEX_TYPE_UINT16;
     std::vector<std::string> lines;   // while a frame is being dumped
+    // the state a HUD split carries over into our own command buffer (bound state doesn't cross command buffers)
+    bool rendering = false;           // inside the game's vkCmdBeginRendering, as recorded in `ri`
+    VkRenderingInfo ri = {};
+    std::vector<VkRenderingAttachmentInfo> color;
+    VkRenderingAttachmentInfo depth = {}, stencil = {};
+    VkPipelineLayout setLayout[4] = {};
+    VkDescriptorSet sets[4] = {};
+    std::vector<PushRec> pushes;
+    float vsPush[16] = {};            // the vertex stage's matrix (first 64 bytes of push constants)
+    bool hasVsPush = false;
+    VkViewport viewport = {}; VkRect2D scissor = {}; float lineWidth = 1.0f;
+    bool hasViewport = false, hasScissor = false, hasLineWidth = false;
+    VkCommandBuffer redirect = VK_NULL_HANDLE;   // after the split: where the game's commands for this one go
+    int splitSlot = -1;
 };
 static std::unordered_map<VkImage, ImgInfo> g_imgs;
 static std::unordered_map<VkImageView, VkImage> g_views;
@@ -192,7 +207,7 @@ REAL(vkCmdBeginRendering); REAL(vkCmdBeginRenderingKHR); REAL(vkCmdEndRendering)
 REAL(vkCmdBindPipeline); REAL(vkCmdBindDescriptorSets); REAL(vkCmdBindVertexBuffers); REAL(vkCmdBindIndexBuffer);
 REAL(vkCmdPushConstants); REAL(vkCmdPushDescriptorSetKHR); REAL(vkCmdDraw); REAL(vkCmdDrawIndexed);
 REAL(vkCmdSetViewport); REAL(vkCmdSetScissor); REAL(vkCmdCopyBufferToImage); REAL(vkCmdPipelineBarrier);
-REAL(vkCmdClearAttachments); REAL(vkCmdBlitImage); REAL(vkCmdCopyImage);
+REAL(vkCmdClearAttachments); REAL(vkCmdBlitImage); REAL(vkCmdCopyImage); REAL(vkCmdSetLineWidth); REAL(vkCmdCopyBuffer); REAL(vkCmdExecuteCommands);
 #undef REAL
 
 // Our own device functions for the screenshot, straight from the driver (never through the hooks).
@@ -450,7 +465,9 @@ static struct {
     HWND glWnd; HDC glDC; HGLRC glRC;                 // our hidden GL context
     VkSemaphore semA, semB, semC; GLuint glSemA, glSemB;
     VkCommandPool pool; uint32_t family = ~0u;
-    VkCommandBuffer cmd1[3], cmd2[3]; VkFence fence[3]; int slot;
+    VkCommandBuffer cmd1[3], cmd2[3]; VkFence fence[3]; int slot;                    // the present pass, three slots
+    VkCommandBuffer cmdIn[3], cmdOut[3], cmdHud[3]; VkFence fenceS[3]; int slotS;  // the HUD split, three slots
+    bool splitLogged;
     uint32_t w, h;                                    // the shared images, 0 = none yet
     bool srgb;                                        // ... in an sRGB format, as the swapchain is
     VkImage img[2]; VkDeviceMemory mem[2]; GLuint glMem[2], glTex[2], glFbo[2];
@@ -553,23 +570,25 @@ static bool BridgeCommands(uint32_t family) {
     VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, family };
     if (D.CreateCommandPool(g_dev, &pci, nullptr, &B.pool) != VK_SUCCESS) { BridgeFail("could not make a command pool"); return false; }
     VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, B.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 3 };
-    if (D.AllocateCommandBuffers(g_dev, &ai, B.cmd1) != VK_SUCCESS || D.AllocateCommandBuffers(g_dev, &ai, B.cmd2) != VK_SUCCESS) {
-        BridgeFail("could not make command buffers");
-        return false;
+    VkCommandBuffer* sets[5] = { B.cmd1, B.cmd2, B.cmdIn, B.cmdOut, B.cmdHud };
+    for (VkCommandBuffer* s : sets) {
+        if (D.AllocateCommandBuffers(g_dev, &ai, s) != VK_SUCCESS) { BridgeFail("could not make command buffers"); return false; }
+        for (int i = 0; i < 3; i++) *(void**)s[i] = *(void**)g_dev;   // our own command buffers need the loader's dispatch table
     }
     for (int i = 0; i < 3; i++) {
-        *(void**)B.cmd1[i] = *(void**)g_dev;   // our own command buffers need the loader's dispatch table
-        *(void**)B.cmd2[i] = *(void**)g_dev;
         VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT };
-        if (D.CreateFence(g_dev, &fci, nullptr, &B.fence[i]) != VK_SUCCESS) { BridgeFail("could not make a fence"); return false; }
+        if (D.CreateFence(g_dev, &fci, nullptr, &B.fence[i]) != VK_SUCCESS || D.CreateFence(g_dev, &fci, nullptr, &B.fenceS[i]) != VK_SUCCESS) {
+            BridgeFail("could not make a fence");
+            return false;
+        }
     }
     B.family = family;
     return true;
 }
 
-static void BridgeFreeImages(VkQueue q) {
+static void BridgeFreeImages() {
     if (!B.w) return;
-    D.QueueWaitIdle(q);
+    D.DeviceWaitIdle(g_dev);
     {
         GlCurrent cur;
         GL.DeleteFramebuffers(2, B.glFbo);
@@ -583,9 +602,9 @@ static void BridgeFreeImages(VkQueue q) {
 
 // IN and OUT, the swapchain's size. With an sRGB swapchain they are sRGB too, so the blits keep the game's values as
 // they are, and GL reads and writes them raw (no decoding, no GL_FRAMEBUFFER_SRGB): FortsGFX sees what it sees in GL.
-static bool BridgeImages(VkQueue q, uint32_t w, uint32_t h, bool srgb) {
+static bool BridgeImages(uint32_t w, uint32_t h, bool srgb) {
     if (B.w == w && B.h == h && B.srgb == srgb) return true;
-    BridgeFreeImages(q);
+    BridgeFreeImages();
     VkPhysicalDeviceMemoryProperties mp;
     D.GetPhysicalDeviceMemoryProperties(g_phys, &mp);
     GlCurrent cur;
@@ -663,19 +682,9 @@ static void BlitFlipped(VkCommandBuffer cb, VkImage src, VkImage dst, int32_t w,
     D.CmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r, VK_FILTER_NEAREST);
 }
 
-// Runs FortsGFX on the image `pi` presents; `mod` is then what to present instead (it waits for our copy back).
-static bool BridgeFrame(VkQueue q, const VkPresentInfoKHR* pi, VkPresentInfoKHR& mod) {
-    if (B.failed || pi->swapchainCount != 1) return false;
-    SwapInfo s;
-    uint32_t family;
-    {
-        std::lock_guard<std::recursive_mutex> lk(g_mx);
-        auto sw = g_swaps.find(pi->pSwapchains[0]);
-        auto qf = g_queueFamily.find(q);
-        if (sw == g_swaps.end() || qf == g_queueFamily.end() || pi->pImageIndices[0] >= sw->second.images.size()) return false;
-        s = sw->second;
-        family = qf->second;
-    }
+// Sets the bridge up (once) and the shared images for this swapchain. False: no effects.
+static bool BridgeEnsure(uint32_t family, const SwapInfo& s) {
+    if (B.failed) return false;
     if (!B.tried) {
         B.tried = true;
         if (!IniInt(L"Effects", 1)) { B.failed = true; VkLog("effects: [Vulkan] Effects=0"); return false; }
@@ -690,7 +699,55 @@ static bool BridgeFrame(VkQueue q, const VkPresentInfoKHR* pi, VkPresentInfoKHR&
         return false;
     }
     if (!s.copyable || !s.writable) { BridgeFail("the swapchain can't be copied to and from"); return false; }
-    if (!BridgeCommands(family) || !BridgeImages(q, s.w, s.h, srgb)) return false;
+    return BridgeCommands(family) && BridgeImages(s.w, s.h, srgb);
+}
+
+// GL's part, between semaphores A and B: IN -> FortsGFX (or as it was) -> OUT, then the control panel over OUT.
+static void GlStage(bool effects, bool panel, int32_t w, int32_t h) {
+    GlCurrent cur;
+    const GLenum inLayouts[2] = { kGlLayoutTransferDst, kGlLayoutTransferSrc };
+    GL.WaitSemaphoreEXT(B.glSemA, 0, nullptr, 2, B.glTex, inLayouts);
+    if (!effects || !GfxBridgeFrame(B.glTex[0], B.glFbo[1], w, h)) {   // only the panel, or FortsGFX off (F9)
+        GL.BindFramebuffer(kGlReadFb, B.glFbo[0]);
+        GL.BindFramebuffer(kGlDrawFb, B.glFbo[1]);
+        GL.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, kGlColorBit, kGlNearest);
+        GL.BindFramebuffer(kGlFramebuffer, 0);
+    }
+    if (effects) CapBridgePhoto(B.glFbo[1]);
+    if (panel) OverlayBridgeDraw(B.glFbo[1]);
+    if (B.testMark) {   // tools/vktest: which way up the round trip comes out
+        GL.BindFramebuffer(kGlFramebuffer, B.glFbo[1]);
+        GL.Enable(kGlScissorTest);
+        GL.Scissor(16, h - 80, 64, 64);
+        GL.ClearColor(1.0f, 0.55f, 0.1f, 1.0f);
+        GL.Clear(kGlColorBit);
+        GL.Disable(kGlScissorTest);
+        GL.BindFramebuffer(kGlFramebuffer, 0);
+    }
+    const GLenum outLayouts[2] = { kGlLayoutTransferDst, kGlLayoutTransferSrc };
+    GL.SignalSemaphoreEXT(B.glSemB, 0, nullptr, 2, B.glTex, outLayouts);
+    GL.Flush();
+    if (effects && ++B.frames == 1) {
+        VkLog("effects: first frame through FortsGFX");
+        OverlayToast("FortsGFX on Vulkan: looks, bloom and the control panel");
+    }
+}
+
+// The present pass: the image about to be presented goes through GL and back - with FortsGFX over all of it when the
+// frame isn't split at the HUD, and/or the control panel. `mod` is then what to present (it waits for the copy back).
+static bool BridgeFrame(VkQueue q, const VkPresentInfoKHR* pi, VkPresentInfoKHR& mod, bool effects, bool panel) {
+    if (B.failed || pi->swapchainCount != 1 || (!effects && !panel)) return false;
+    SwapInfo s;
+    uint32_t family;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        auto sw = g_swaps.find(pi->pSwapchains[0]);
+        auto qf = g_queueFamily.find(q);
+        if (sw == g_swaps.end() || qf == g_queueFamily.end() || pi->pImageIndices[0] >= sw->second.images.size()) return false;
+        s = sw->second;
+        family = qf->second;
+    }
+    if (!BridgeEnsure(family, s)) return false;
     VkImage swapImg = s.images[pi->pImageIndices[0]];
     int32_t w = (int32_t)s.w, h = (int32_t)s.h;
     int k = B.slot = (B.slot + 1) % 3;
@@ -717,32 +774,8 @@ static bool BridgeFrame(VkQueue q, const VkPresentInfoKHR* pi, VkPresentInfoKHR&
     VkSubmitInfo s1 = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, pi->waitSemaphoreCount, pi->pWaitSemaphores, stages.data(), 1, &c1, 1, &B.semA };
     if (D.QueueSubmit(q, 1, &s1, VK_NULL_HANDLE) != VK_SUCCESS) { BridgeFail("a submit failed"); return false; }
 
-    // 2. GL: IN -> FortsGFX -> OUT, the control panel over it
-    {
-        GlCurrent cur;
-        const GLenum inLayouts[2] = { kGlLayoutTransferDst, kGlLayoutTransferSrc };
-        GL.WaitSemaphoreEXT(B.glSemA, 0, nullptr, 2, B.glTex, inLayouts);
-        if (!GfxBridgeFrame(B.glTex[0], B.glFbo[1], w, h)) {   // FortsGFX off (F9): the frame as it was
-            GL.BindFramebuffer(kGlReadFb, B.glFbo[0]);
-            GL.BindFramebuffer(kGlDrawFb, B.glFbo[1]);
-            GL.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, kGlColorBit, kGlNearest);
-            GL.BindFramebuffer(kGlFramebuffer, 0);
-        }
-        CapBridgePhoto(B.glFbo[1]);
-        OverlayBridgeFrame(s.wnd, B.glFbo[1]);
-        if (B.testMark) {   // tools/vktest: which way up the round trip comes out
-            GL.BindFramebuffer(kGlFramebuffer, B.glFbo[1]);
-            GL.Enable(kGlScissorTest);
-            GL.Scissor(16, h - 80, 64, 64);
-            GL.ClearColor(1.0f, 0.55f, 0.1f, 1.0f);
-            GL.Clear(kGlColorBit);
-            GL.Disable(kGlScissorTest);
-            GL.BindFramebuffer(kGlFramebuffer, 0);
-        }
-        const GLenum outLayouts[2] = { kGlLayoutTransferDst, kGlLayoutTransferSrc };
-        GL.SignalSemaphoreEXT(B.glSemB, 0, nullptr, 2, B.glTex, outLayouts);
-        GL.Flush();
-    }
+    // 2. GL
+    GlStage(effects, panel, w, h);
 
     // 3. OUT -> the game's image, which is then presented
     VkCommandBuffer c2 = B.cmd2[k];
@@ -760,10 +793,214 @@ static bool BridgeFrame(VkQueue q, const VkPresentInfoKHR* pi, VkPresentInfoKHR&
     mod = *pi;
     mod.waitSemaphoreCount = 1;
     mod.pWaitSemaphores = &B.semC;
-    if (++B.frames == 1) {
-        VkLog("effects: first frame through FortsGFX");
-        OverlayToast("FortsGFX on Vulkan: looks, bloom and the control panel");
+    return true;
+}
+
+// ---------------------------------------------------------------- the HUD split
+// In a battle Forts draws the background, then the forts, then - in the same pass as the last world sprites - the HUD:
+// sprites from ui/ under a fixed screen matrix (a virtual screen 600 units high with its origin top left: scale
+// (2/width, -2/600), offset (-1, 1)), then text and the cursor. At the first such draw, once the playfield has been
+// drawn this frame, the game's pass is ended there and the rest of that command buffer's commands are recorded into our
+// cmdHud instead, with the pass begun again on the same attachments (loaded) and the bound state carried over. When the
+// game submits it: the part before runs and is copied into IN (signals A), GL runs FortsGFX into OUT (A -> B), then
+// OUT is copied back and cmdHud draws the HUD over it (waits for B), with the game's own semaphores and fence where
+// they were. So FortsGFX goes under the HUD, as in GL. [Vulkan] SplitHud=0: over the whole frame at present instead.
+
+static int g_redirects;                 // game command buffers whose commands are going to our cmdHud
+static bool g_worldSeen, g_splitDone;   // this frame: the playfield has been drawn; the frame has been split
+static uint32_t g_mainFamily = ~0u;     // the game's queue family
+
+static bool SplitOn() {
+    static int on = -1;
+    if (on < 0) on = IniInt(L"Effects", 1) && IniInt(L"SplitHud", 1);
+    return on && !B.failed;
+}
+
+static std::string DrawTexture(const CmdState& c) {   // what binding 0 of set 0 shows: the sprite's image file
+    auto s = g_sets.find(c.sets[0]);
+    if (s == g_sets.end()) return "";
+    auto b = s->second.find(0);
+    if (b == s->second.end()) return "";
+    auto v = g_views.find(b->second);
+    if (v == g_views.end()) return "";
+    auto i = g_imgs.find(v->second);
+    if (i == g_imgs.end()) return "";
+    std::string n = i->second.name;
+    for (char& ch : n) ch = (char)tolower((unsigned char)ch);
+    std::replace(n.begin(), n.end(), '\\', '/');
+    return n;
+}
+static bool IsPlayfield(const std::string& t) {   // the map's backdrop or the forts: this is a battle
+    return t.find("environment/") != std::string::npos || t.find("materials/") != std::string::npos ||
+           t.find("devices/") != std::string::npos || t.find("weapons/") != std::string::npos;
+}
+static bool IsHudStart(const CmdState& c, const std::string& t) {
+    const float* m = c.vsPush;
+    return c.hasVsPush && t.compare(0, 3, "ui/") == 0 && m[0] > 0.0f && fabsf(m[5] + 1.0f / 300.0f) < 2e-6f &&
+           fabsf(m[12] + 1.0f) < 1e-4f && fabsf(m[13] - 1.0f) < 1e-4f;
+}
+
+static VkCommandBuffer Redir(VkCommandBuffer cb) {   // where a game command for `cb` goes
+    if (!g_redirects) return cb;
+    std::lock_guard<std::recursive_mutex> lk(g_mx);
+    auto it = g_cmds.find(cb);
+    return it != g_cmds.end() && it->second.redirect ? it->second.redirect : cb;
+}
+
+static void ReplayState(VkCommandBuffer to, const CmdState& c) {
+    if (c.hasViewport) r_vkCmdSetViewport(to, 0, 1, &c.viewport);
+    if (c.hasScissor) r_vkCmdSetScissor(to, 0, 1, &c.scissor);
+    if (r_vkCmdSetLineWidth) r_vkCmdSetLineWidth(to, c.hasLineWidth ? c.lineWidth : 1.0f);
+    if (c.pipe) r_vkCmdBindPipeline(to, VK_PIPELINE_BIND_POINT_GRAPHICS, c.pipe);
+    for (uint32_t i = 0; i < 4; i++)
+        if (c.sets[i]) r_vkCmdBindDescriptorSets(to, VK_PIPELINE_BIND_POINT_GRAPHICS, c.setLayout[i], i, 1, &c.sets[i], 0, nullptr);
+    for (uint32_t i = 0; i < 4; i++)
+        if (c.vb[i]) r_vkCmdBindVertexBuffers(to, i, 1, &c.vb[i], &c.vbOff[i]);
+    if (c.ib && r_vkCmdBindIndexBuffer) r_vkCmdBindIndexBuffer(to, c.ib, c.ibOff, c.ibType);
+    for (const PushRec& p : c.pushes) r_vkCmdPushConstants(to, p.layout, p.stages, p.off, p.size, p.data);
+}
+
+static uint32_t g_splitW, g_splitH;
+
+// At the first HUD draw: ends the game's pass in `cb` and records the copies and our cmdHud for slot k. g_mx held.
+static bool Split(VkCommandBuffer cb, CmdState& c) {
+    if (c.color.empty() || !r_vkCmdBeginRendering && !r_vkCmdBeginRenderingKHR) return false;
+    auto v = g_views.find(c.color[0].imageView);
+    if (v == g_views.end()) return false;
+    VkImage target = v->second;
+    const SwapInfo* sw = nullptr;
+    for (auto& s : g_swaps)
+        for (VkImage im : s.second.images) if (im == target) sw = &s.second;
+    if (!sw) {
+        if (!B.splitLogged) { B.splitLogged = true; VkLog("effects: the HUD is drawn into an image that isn't presented - not split"); }
+        return false;
     }
+    if (g_mainFamily == ~0u || !BridgeEnsure(g_mainFamily, *sw)) return false;
+    int32_t w = (int32_t)sw->w, h = (int32_t)sw->h;
+    int k = B.slotS = (B.slotS + 1) % 3;
+    D.WaitForFences(g_dev, 1, &B.fenceS[k], VK_TRUE, 2000000000ull);
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    VkImageLayout drawn = c.color[0].imageLayout;
+
+    // the world -> IN
+    VkCommandBuffer ci = B.cmdIn[k];
+    D.ResetCommandBuffer(ci, 0);
+    D.BeginCommandBuffer(ci, &bi);
+    Barrier(ci, target, drawn, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    Barrier(ci, B.img[0], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    if (!B.outKnown) {
+        Barrier(ci, B.img[1], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, 0,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        B.outKnown = true;
+    }
+    BlitFlipped(ci, target, B.img[0], w, h);
+    D.EndCommandBuffer(ci);
+
+    // OUT -> the image, ready to be drawn on again
+    VkCommandBuffer co = B.cmdOut[k];
+    D.ResetCommandBuffer(co, 0);
+    D.BeginCommandBuffer(co, &bi);
+    Barrier(co, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    BlitFlipped(co, B.img[1], target, w, h);
+    Barrier(co, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, drawn, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    D.EndCommandBuffer(co);
+
+    // the game's pass ends here; the HUD's begins in cmdHud on the same attachments, as they are
+    (r_vkCmdEndRendering ? r_vkCmdEndRendering : r_vkCmdEndRenderingKHR)(cb);
+    VkCommandBuffer hud = B.cmdHud[k];
+    D.ResetCommandBuffer(hud, 0);
+    D.BeginCommandBuffer(hud, &bi);
+    std::vector<VkRenderingAttachmentInfo> col = c.color;
+    for (auto& a : col) { a.pNext = nullptr; a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; }
+    VkRenderingAttachmentInfo dep = c.depth, sten = c.stencil;
+    dep.pNext = sten.pNext = nullptr;
+    dep.loadOp = sten.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    VkRenderingInfo ri = c.ri;
+    ri.pNext = nullptr;
+    ri.colorAttachmentCount = (uint32_t)col.size();
+    ri.pColorAttachments = col.data();
+    ri.pDepthAttachment = c.depth.imageView ? &dep : nullptr;
+    ri.pStencilAttachment = c.stencil.imageView ? &sten : nullptr;
+    (r_vkCmdBeginRendering ? r_vkCmdBeginRendering : r_vkCmdBeginRenderingKHR)(hud, &ri);
+    ReplayState(hud, c);
+    c.redirect = hud;
+    c.splitSlot = k;
+    g_redirects++;
+    g_splitW = (uint32_t)w; g_splitH = (uint32_t)h;
+    if (!B.splitLogged) {
+        B.splitLogged = true;
+        VkLog("effects: battle frame split at the HUD (first HUD draw in cmd#%d): FortsGFX goes under the HUD", Id(kCmd, cb));
+    }
+    return true;
+}
+
+static int g_testSplitAt = -1, g_frameDraws;   // [Vulkan] TestSplitAt=N (tools/vktest): split at the frame's Nth draw
+
+static void MaybeSplit(VkCommandBuffer cb, CmdState& c) {   // before a draw; g_mx held
+    if (g_splitDone || c.redirect || !c.rendering || !SplitOn()) return;
+    if (g_testSplitAt < 0) g_testSplitAt = IniInt(L"TestSplitAt", 0);
+    if (g_testSplitAt > 0) {
+        if (++g_frameDraws == g_testSplitAt) { g_splitDone = true; Split(cb, c); }
+        return;
+    }
+    std::string t = DrawTexture(c);
+    if (!g_worldSeen) { g_worldSeen = IsPlayfield(t); return; }
+    if (!IsHudStart(c, t)) return;
+    g_splitDone = true;   // one try a frame
+    Split(cb, c);
+}
+
+// Submits a batch list in which a command buffer was split (see above). False: nothing in it was split.
+static bool SubmitSplit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f, VkResult& r) {
+    int bi = -1, ci = -1, k = -1;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        if (!g_redirects) return false;
+        for (uint32_t i = 0; i < n && bi < 0; i++)
+            for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
+                auto it = g_cmds.find(si[i].pCommandBuffers[j]);
+                if (it != g_cmds.end() && it->second.splitSlot >= 0) {
+                    bi = (int)i; ci = (int)j; k = it->second.splitSlot;
+                    it->second.splitSlot = -1;
+                    it->second.redirect = VK_NULL_HANDLE;
+                    g_redirects--;
+                    break;
+                }
+            }
+    }
+    if (bi < 0) return false;
+    const VkSubmitInfo& b = si[bi];
+    // 1. everything up to the split command buffer, then the copy into IN
+    std::vector<VkSubmitInfo> part1(si, si + bi);
+    std::vector<VkCommandBuffer> cmds1(b.pCommandBuffers, b.pCommandBuffers + ci + 1);
+    cmds1.push_back(B.cmdIn[k]);
+    VkSubmitInfo s1 = b;
+    s1.commandBufferCount = (uint32_t)cmds1.size();
+    s1.pCommandBuffers = cmds1.data();
+    s1.signalSemaphoreCount = 1;
+    s1.pSignalSemaphores = &B.semA;
+    part1.push_back(s1);
+    r = r_vkQueueSubmit(q, (uint32_t)part1.size(), part1.data(), VK_NULL_HANDLE);
+    // 2. GL
+    if (r == VK_SUCCESS) GlStage(true, false, (int32_t)g_splitW, (int32_t)g_splitH);
+    // 3. the copy back, the HUD and the rest, with the game's semaphores and fence
+    std::vector<VkCommandBuffer> cmds2 = { B.cmdOut[k], B.cmdHud[k] };
+    cmds2.insert(cmds2.end(), b.pCommandBuffers + ci + 1, b.pCommandBuffers + b.commandBufferCount);
+    VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo s2 = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, r == VK_SUCCESS ? 1u : 0u, &B.semB, &st, (uint32_t)cmds2.size(), cmds2.data(),
+                        b.signalSemaphoreCount, b.pSignalSemaphores };
+    std::vector<VkSubmitInfo> part2 = { s2 };
+    part2.insert(part2.end(), si + bi + 1, si + n);
+    VkResult r2 = r_vkQueueSubmit(q, (uint32_t)part2.size(), part2.data(), f);
+    D.ResetFences(g_dev, 1, &B.fenceS[k]);
+    r_vkQueueSubmit(q, 0, nullptr, B.fenceS[k]);   // signals once all of it is done: the slot can be used again
+    if (r == VK_SUCCESS) r = r2;
+    if (r != VK_SUCCESS) BridgeFail(Fmt("a split submit failed (%d)", r).c_str());
     return true;
 }
 
@@ -780,7 +1017,7 @@ static void DeviceGone() {
     }
     for (int i = 0; i < 2 && B.w; i++) { D.DestroyImage(g_dev, B.img[i], nullptr); D.FreeMemory(g_dev, B.mem[i], nullptr); }
     for (VkSemaphore s : { B.semA, B.semB, B.semC, g_shotSem }) if (s) D.DestroySemaphore(g_dev, s, nullptr);
-    for (VkFence f : { B.fence[0], B.fence[1], B.fence[2], g_shotFence }) if (f) D.DestroyFence(g_dev, f, nullptr);
+    for (VkFence f : { B.fence[0], B.fence[1], B.fence[2], B.fenceS[0], B.fenceS[1], B.fenceS[2], g_shotFence }) if (f) D.DestroyFence(g_dev, f, nullptr);
     for (VkCommandPool p : { B.pool, g_shotPool }) if (p) D.DestroyCommandPool(g_dev, p, nullptr);
     if (g_shotBuf) { D.DestroyBuffer(g_dev, g_shotBuf, nullptr); D.FreeMemory(g_dev, g_shotMem, nullptr); }
     HWND wnd = B.glWnd; HDC dc = B.glDC; HGLRC rc = B.glRC;
@@ -873,6 +1110,8 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkDestroyDevice(VkDevice d, const VkAllocat
             g_swaps.clear();
             g_queueFamily.clear();
             g_cmds.clear();
+            g_redirects = 0;
+            g_mainFamily = ~0u;
         }
     }
     r_vkDestroyDevice(d, a);
@@ -883,6 +1122,7 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkGetDeviceQueue(VkDevice d, uint32_t famil
     std::lock_guard<std::recursive_mutex> lk(g_mx);
     if (*q && !g_queueFamily.count(*q)) VkLog("queue: family %u index %u", family, index);
     if (*q) g_queueFamily[*q] = family;
+    if (*q && g_mainFamily == ~0u) g_mainFamily = family;
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkGetDeviceQueue2(VkDevice d, const VkDeviceQueueInfo2* qi, VkQueue* q) {
     r_vkGetDeviceQueue2(d, qi, q);
@@ -1009,13 +1249,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPr
         else if ((shot = ShotStart(q, cur, shotMod))) cur = &shotMod;
         VkLog("frame %u written to vk_frame_%02u.txt", g_dumpFrame, dumped);
     }
+    HWND wnd = nullptr;
+    if (pi->swapchainCount) { auto sw = g_swaps.find(pi->pSwapchains[0]); if (sw != g_swaps.end()) wnd = sw->second.wnd; }
     lk.unlock();
-    if (BridgeFrame(q, cur, bridgeMod)) cur = &bridgeMod;
+    // the control panel's keys every frame; the present pass when there is something to draw over the frame (or the
+    // effects themselves, when the frame isn't split at the HUD)
+    bool panel = OverlayBridgeUpdate(wnd);
+    if (BridgeFrame(q, cur, bridgeMod, !SplitOn(), panel)) cur = &bridgeMod;
     if (shotLater) { lk.lock(); if ((shot = ShotStart(q, cur, shotMod))) cur = &shotMod; lk.unlock(); }
     VkResult r = r_vkQueuePresentKHR(q, cur);
     lk.lock();
     if (shot) ShotFinish(dumped);
     else if (dumped) VkLog("no screenshot of that frame");
+    g_worldSeen = g_splitDone = false;   // the next frame
+    g_frameDraws = 0;
 
     static bool keyPrev;
     DWORD pid = 0;
@@ -1048,6 +1295,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueueSubmit(VkQueue q, uint32_t n, co
             for (uint32_t i = 0; i < n; i++)
                 for (uint32_t j = 0; j < si[i].commandBufferCount; j++) Submitted(q, si[i].pCommandBuffers[j]);
     }
+    VkResult r;
+    if (SubmitSplit(q, n, si, f, r)) return r;
     return r_vkQueueSubmit(q, n, si, f);
 }
 static VkResult Submit2(VkQueue q, uint32_t n, const VkSubmitInfo2* si, VkFence f, PFN_vkQueueSubmit2 real) {
@@ -1292,11 +1541,13 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkUpdateDescriptorSetWithTemplate(VkDevice 
 // ---------------------------------------------------------------- command recording
 
 #define LOCK std::lock_guard<std::recursive_mutex> lk(g_mx)
+// Every command goes to Redir(cb): the game's command buffer, or our cmdHud once a split has happened in it.
 
 static VKAPI_ATTR VkResult VKAPI_CALL hk_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo* bi) {
     {
         LOCK;
         CmdState& c = g_cmds[cb];
+        if (c.splitSlot >= 0) g_redirects--;   // recorded again before it was submitted: that split is dropped
         c = CmdState();
         g_frame.cmdBegins++;
         if (g_dumpRec) DL(cb, Fmt("BEGIN cmd#%d flags 0x%x", Id(kCmd, cb), bi->flags));
@@ -1304,7 +1555,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_vkBeginCommandBuffer(VkCommandBuffer cb
     return r_vkBeginCommandBuffer(cb, bi);
 }
 static VKAPI_ATTR VkResult VKAPI_CALL hk_vkEndCommandBuffer(VkCommandBuffer cb) {
-    { LOCK; if (g_dumpRec) DL(cb, "END"); }
+    VkCommandBuffer hud = VK_NULL_HANDLE;
+    {
+        LOCK;
+        if (g_dumpRec) DL(cb, "END");
+        auto it = g_cmds.find(cb);
+        if (it != g_cmds.end()) hud = it->second.redirect;
+    }
+    if (hud) r_vkEndCommandBuffer(hud);
     return r_vkEndCommandBuffer(cb);
 }
 
@@ -1323,16 +1581,22 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBeginRenderPass(VkCommandBuffer cb, co
                        bi->renderArea.offset.y, bi->renderArea.extent.width, bi->renderArea.extent.height, clear.c_str(), views.c_str()));
         }
     }
-    r_vkCmdBeginRenderPass(cb, bi, sc);
+    r_vkCmdBeginRenderPass(Redir(cb), bi, sc);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdEndRenderPass(VkCommandBuffer cb) {
     { LOCK; if (g_dumpRec) DL(cb, "END RENDERPASS"); }
-    r_vkCmdEndRenderPass(cb);
+    r_vkCmdEndRenderPass(Redir(cb));
 }
 static void BeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri, PFN_vkCmdBeginRendering real) {
     {
         LOCK;
         g_frame.rendering++;
+        CmdState& c = g_cmds[cb];   // kept for a split: the pass begun again on the same attachments
+        c.rendering = true;
+        c.ri = *ri;
+        c.color.assign(ri->pColorAttachments, ri->pColorAttachments + ri->colorAttachmentCount);
+        c.depth = ri->pDepthAttachment ? *ri->pDepthAttachment : VkRenderingAttachmentInfo{};
+        c.stencil = ri->pStencilAttachment ? *ri->pStencilAttachment : VkRenderingAttachmentInfo{};
         if (g_dumpRec) {
             std::string att;
             for (uint32_t i = 0; i < ri->colorAttachmentCount; i++) {
@@ -1346,12 +1610,16 @@ static void BeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri, PFN_vk
                        ri->renderArea.extent.height, att.c_str(), ri->pDepthAttachment ? " + depth" : ""));
         }
     }
-    real(cb, ri);
+    real(Redir(cb), ri);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri) { BeginRendering(cb, ri, r_vkCmdBeginRendering); }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBeginRenderingKHR(VkCommandBuffer cb, const VkRenderingInfo* ri) { BeginRendering(cb, ri, r_vkCmdBeginRenderingKHR); }
-static VKAPI_ATTR void VKAPI_CALL hk_vkCmdEndRendering(VkCommandBuffer cb) { { LOCK; if (g_dumpRec) DL(cb, "END RENDERING"); } r_vkCmdEndRendering(cb); }
-static VKAPI_ATTR void VKAPI_CALL hk_vkCmdEndRenderingKHR(VkCommandBuffer cb) { { LOCK; if (g_dumpRec) DL(cb, "END RENDERING"); } r_vkCmdEndRenderingKHR(cb); }
+static void EndRendering(VkCommandBuffer cb, PFN_vkCmdEndRendering real) {
+    { LOCK; g_cmds[cb].rendering = false; if (g_dumpRec) DL(cb, "END RENDERING"); }
+    real(Redir(cb));
+}
+static VKAPI_ATTR void VKAPI_CALL hk_vkCmdEndRendering(VkCommandBuffer cb) { EndRendering(cb, r_vkCmdEndRendering); }
+static VKAPI_ATTR void VKAPI_CALL hk_vkCmdEndRenderingKHR(VkCommandBuffer cb) { EndRendering(cb, r_vkCmdEndRenderingKHR); }
 
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p) {
     {
@@ -1364,7 +1632,7 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindPipeline(VkCommandBuffer cb, VkPip
                        pi != g_pipes.end() ? pi->second.blend.c_str() : "?"));
         }
     }
-    r_vkCmdBindPipeline(cb, bp, p);
+    r_vkCmdBindPipeline(Redir(cb), bp, p);
 }
 
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t first,
@@ -1372,6 +1640,10 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindDescriptorSets(VkCommandBuffer cb,
     {
         LOCK;
         g_frame.descBinds++;
+        if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+            CmdState& c = g_cmds[cb];
+            for (uint32_t i = 0; i < n; i++) if (first + i < 4) { c.sets[first + i] = sets[i]; c.setLayout[first + i] = layout; }
+        }
         if (g_dumpRec) {
             std::string s;
             for (uint32_t i = 0; i < n; i++) {
@@ -1385,7 +1657,7 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindDescriptorSets(VkCommandBuffer cb,
             DL(cb, Fmt("DESCRIPTORS layout#%d %s", Id(kLayout, layout), s.c_str()));
         }
     }
-    r_vkCmdBindDescriptorSets(cb, bp, layout, first, n, sets, nd, dyn);
+    r_vkCmdBindDescriptorSets(Redir(cb), bp, layout, first, n, sets, nd, dyn);
 }
 
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer* bufs, const VkDeviceSize* offs) {
@@ -1397,7 +1669,7 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindVertexBuffers(VkCommandBuffer cb, 
             for (uint32_t i = 0; i < n; i++)
                 DL(cb, Fmt("VERTEX BUFFER b%u buf#%d +%llu%s", first + i, Id(kBuf, bufs[i]), (unsigned long long)offs[i], BufPtr(bufs[i], 0) ? " (mapped)" : ""));
     }
-    r_vkCmdBindVertexBuffers(cb, first, n, bufs, offs);
+    r_vkCmdBindVertexBuffers(Redir(cb), first, n, bufs, offs);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, VkIndexType t) {
     {
@@ -1406,13 +1678,22 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBindIndexBuffer(VkCommandBuffer cb, Vk
         c.ib = b; c.ibOff = off; c.ibType = t;
         if (g_dumpRec) DL(cb, Fmt("INDEX BUFFER buf#%d +%llu %s%s", Id(kBuf, b), (unsigned long long)off, t == VK_INDEX_TYPE_UINT16 ? "u16" : "u32", BufPtr(b, 0) ? " (mapped)" : ""));
     }
-    r_vkCmdBindIndexBuffer(cb, b, off, t);
+    r_vkCmdBindIndexBuffer(Redir(cb), b, off, t);
 }
 
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags st, uint32_t off, uint32_t size, const void* v) {
     {
         LOCK;
         g_frame.pushes++;
+        CmdState& c = g_cmds[cb];
+        if (size <= sizeof(PushRec::data)) {   // the latest values per range, for a split to set again
+            PushRec* p = nullptr;
+            for (auto& x : c.pushes) if (x.stages == st && x.off == off) p = &x;
+            if (!p) { c.pushes.push_back({}); p = &c.pushes.back(); }
+            p->layout = layout; p->stages = st; p->off = off; p->size = size;
+            memcpy(p->data, v, size);
+        }
+        if ((st & VK_SHADER_STAGE_VERTEX_BIT) && off == 0 && size >= 64) { memcpy(c.vsPush, v, 64); c.hasVsPush = true; }
         if (g_dumpRec) {
             std::string s;
             const float* f = (const float*)v;
@@ -1420,7 +1701,7 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdPushConstants(VkCommandBuffer cb, VkPi
             DL(cb, Fmt("PUSH layout#%d stages 0x%x +%u %u bytes: %s", Id(kLayout, layout), st, off, size, s.c_str()));
         }
     }
-    r_vkCmdPushConstants(cb, layout, st, off, size, v);
+    r_vkCmdPushConstants(Redir(cb), layout, st, off, size, v);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdPushDescriptorSetKHR(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set,
                                                                uint32_t n, const VkWriteDescriptorSet* w) {
@@ -1434,10 +1715,13 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdPushDescriptorSetKHR(VkCommandBuffer c
             DL(cb, Fmt("PUSH DESCRIPTORS layout#%d set%u%s", Id(kLayout, layout), set, s.c_str()));
         }
     }
-    r_vkCmdPushDescriptorSetKHR(cb, bp, layout, set, n, w);
+    r_vkCmdPushDescriptorSetKHR(Redir(cb), bp, layout, set, n, w);
 }
 
+// Draws: the HUD split happens before the first HUD draw; once split, the lab's "Hide HUD" (and photo mode) drops
+// what the game draws after it.
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdDraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
+    bool drop;
     {
         LOCK;
         CmdState& c = g_cmds[cb];
@@ -1449,10 +1733,13 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdDraw(VkCommandBuffer cb, uint32_t vc, 
             for (uint32_t i = 0; i < n; i++) idx[i] = fv + i;
             DL(cb, Fmt("DRAW %u vertices from %u x%u%s", vc, fv, ic, Vertices(c, idx, n).c_str()));
         }
+        MaybeSplit(cb, c);
+        drop = c.redirect && GfxLabState().hideHud;
     }
-    r_vkCmdDraw(cb, vc, ic, fv, fi);
+    if (!drop) r_vkCmdDraw(Redir(cb), vc, ic, fv, fi);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t ic, uint32_t inst, uint32_t fidx, int32_t voff, uint32_t fi) {
+    bool drop;
     {
         LOCK;
         CmdState& c = g_cmds[cb];
@@ -1471,17 +1758,31 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdDrawIndexed(VkCommandBuffer cb, uint32
                 }
             DL(cb, Fmt("DRAW INDEXED %u indices from %u, vertex offset %d x%u%s", ic, fidx, voff, inst, Vertices(c, idx, n).c_str()));
         }
+        MaybeSplit(cb, c);
+        drop = c.redirect && GfxLabState().hideHud;
     }
-    r_vkCmdDrawIndexed(cb, ic, inst, fidx, voff, fi);
+    if (!drop) r_vkCmdDrawIndexed(Redir(cb), ic, inst, fidx, voff, fi);
 }
 
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport* v) {
-    { LOCK; if (g_dumpRec && n) DL(cb, Fmt("VIEWPORT %.0f,%.0f %.0fx%.0f", v[0].x, v[0].y, v[0].width, v[0].height)); }
-    r_vkCmdSetViewport(cb, first, n, v);
+    {
+        LOCK;
+        if (first == 0 && n) { CmdState& c = g_cmds[cb]; c.viewport = v[0]; c.hasViewport = true; }
+        if (g_dumpRec && n) DL(cb, Fmt("VIEWPORT %.0f,%.0f %.0fx%.0f", v[0].x, v[0].y, v[0].width, v[0].height));
+    }
+    r_vkCmdSetViewport(Redir(cb), first, n, v);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdSetScissor(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkRect2D* r) {
-    { LOCK; if (g_dumpRec && n) DL(cb, Fmt("SCISSOR %d,%d %ux%u", r[0].offset.x, r[0].offset.y, r[0].extent.width, r[0].extent.height)); }
-    r_vkCmdSetScissor(cb, first, n, r);
+    {
+        LOCK;
+        if (first == 0 && n) { CmdState& c = g_cmds[cb]; c.scissor = r[0]; c.hasScissor = true; }
+        if (g_dumpRec && n) DL(cb, Fmt("SCISSOR %d,%d %ux%u", r[0].offset.x, r[0].offset.y, r[0].extent.width, r[0].extent.height));
+    }
+    r_vkCmdSetScissor(Redir(cb), first, n, r);
+}
+static VKAPI_ATTR void VKAPI_CALL hk_vkCmdSetLineWidth(VkCommandBuffer cb, float wdt) {
+    { LOCK; CmdState& c = g_cmds[cb]; c.lineWidth = wdt; c.hasLineWidth = true; }
+    r_vkCmdSetLineWidth(Redir(cb), wdt);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer b, VkImage im, VkImageLayout l, uint32_t n, const VkBufferImageCopy* r) {
     {
@@ -1491,7 +1792,7 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBufferToImage(VkCommandBuffer cb, 
             DL(cb, Fmt("UPLOAD buf#%d -> %s, %u regions (first %ux%u at %d,%d mip %u)", Id(kBuf, b), ImgDesc(im).c_str(), n, r[0].imageExtent.width,
                        r[0].imageExtent.height, r[0].imageOffset.x, r[0].imageOffset.y, r[0].imageSubresource.mipLevel));
     }
-    r_vkCmdCopyBufferToImage(cb, b, im, l, n, r);
+    r_vkCmdCopyBufferToImage(Redir(cb), b, im, l, n, r);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep,
                                                           uint32_t nm, const VkMemoryBarrier* m, uint32_t nb, const VkBufferMemoryBarrier* b,
@@ -1506,20 +1807,28 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkCmdPipelineBarrier(VkCommandBuffer cb, Vk
             DL(cb, Fmt("BARRIER stages 0x%x->0x%x, %u memory, %u buffer, %u image%s", src, dst, nm, nb, ni, s.c_str()));
         }
     }
-    r_vkCmdPipelineBarrier(cb, src, dst, dep, nm, m, nb, b, ni, im);
+    r_vkCmdPipelineBarrier(Redir(cb), src, dst, dep, nm, m, nb, b, ni, im);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdClearAttachments(VkCommandBuffer cb, uint32_t n, const VkClearAttachment* a, uint32_t nr, const VkClearRect* r) {
     { LOCK; if (g_dumpRec) DL(cb, Fmt("CLEAR ATTACHMENTS %u, %u rects", n, nr)); }
-    r_vkCmdClearAttachments(cb, n, a, nr, r);
+    r_vkCmdClearAttachments(Redir(cb), n, a, nr, r);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdBlitImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n,
                                                     const VkImageBlit* r, VkFilter f) {
     { LOCK; if (g_dumpRec) DL(cb, Fmt("BLIT %s -> %s", ImgDesc(s).c_str(), ImgDesc(d).c_str())); }
-    r_vkCmdBlitImage(cb, s, sl, d, dl, n, r, f);
+    r_vkCmdBlitImage(Redir(cb), s, sl, d, dl, n, r, f);
 }
 static VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageCopy* r) {
     { LOCK; if (g_dumpRec) DL(cb, Fmt("COPY IMAGE %s -> %s", ImgDesc(s).c_str(), ImgDesc(d).c_str())); }
-    r_vkCmdCopyImage(cb, s, sl, d, dl, n, r);
+    r_vkCmdCopyImage(Redir(cb), s, sl, d, dl, n, r);
+}
+static VKAPI_ATTR void VKAPI_CALL hk_vkCmdCopyBuffer(VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n, const VkBufferCopy* r) {
+    { LOCK; if (g_dumpRec) DL(cb, Fmt("COPY BUFFER buf#%d -> buf#%d, %u regions", Id(kBuf, s), Id(kBuf, d), n)); }
+    r_vkCmdCopyBuffer(Redir(cb), s, d, n, r);
+}
+static VKAPI_ATTR void VKAPI_CALL hk_vkCmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer* cbs) {
+    { LOCK; if (g_dumpRec) DL(cb, Fmt("EXECUTE %u secondary command buffers", n)); }
+    r_vkCmdExecuteCommands(Redir(cb), n, cbs);
 }
 #undef LOCK
 
@@ -1544,7 +1853,7 @@ static const Hook kHooks[] = {
     HK(vkCmdBindPipeline), HK(vkCmdBindDescriptorSets), HK(vkCmdBindVertexBuffers), HK(vkCmdBindIndexBuffer),
     HK(vkCmdPushConstants), HK(vkCmdPushDescriptorSetKHR), HK(vkCmdDraw), HK(vkCmdDrawIndexed),
     HK(vkCmdSetViewport), HK(vkCmdSetScissor), HK(vkCmdCopyBufferToImage), HK(vkCmdPipelineBarrier),
-    HK(vkCmdClearAttachments), HK(vkCmdBlitImage), HK(vkCmdCopyImage),
+    HK(vkCmdClearAttachments), HK(vkCmdBlitImage), HK(vkCmdCopyImage), HK(vkCmdSetLineWidth), HK(vkCmdCopyBuffer), HK(vkCmdExecuteCommands),
 };
 #undef HK
 

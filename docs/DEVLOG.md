@@ -6,6 +6,32 @@ A proxy `opengl32.dll` for Forts. Windows loads it from the game folder instead 
 system one; it forwards every OpenGL call to the real `C:\Windows\System32\opengl32.dll`
 and adds a graphics layer on top.
 
+## Vulkan, phase V1b — FortsGFX under the HUD
+
+From the first Vulkan session's dumps (a 4K battle, `vk_frame_03`): Forts records a frame as several one-time
+command buffers, each submitted on its own, all drawing straight into the swapchain image with dynamic rendering and
+a D16 depth buffer: the backdrop (sky, parallax layers, props), then the forts (materials, devices, weapons,
+effects), then a last pass that finishes the world sprites and draws the HUD. Every draw's vertex is pos.xy, uv.xy,
+colour.rgba (32 bytes) with the transform as a push-constant matrix; binding 0 of set 0 is the sprite's image, and the
+VKIMG names (the DevIL file loaded just before `vkCreateImage`) give its path, so the draw stream reads like GL's.
+The HUD starts at the first draw from `ui/` under the HUD matrix: scale (2/width, -2/600), offset (-1, 1) - a virtual
+screen 600 units high, origin top left (the GL version's `HudVirtualHeight`). Backdrop layers use the same scale but
+other offsets; the world uses the camera.
+
+So the battle frame is split there (`vulkan.cpp`, "the HUD split"): once a playfield texture (`environment/`,
+`materials/`, `devices/`, `weapons/`) has been drawn this frame, at that first HUD draw the game's pass is ended, and
+every later command for that command buffer goes to our `cmdHud` instead (all of Forts' vkCmd* functions - from its
+own import strings: rendering, binds, push constants, draws, viewport/scissor/line width, barriers, copies, execute -
+are wrapped and redirected), which begins the pass again on the same attachments with LOAD and gets the bound state
+(pipeline, sets, vertex buffers, push constants, viewport, scissor, line width) replayed. At the game's submit the
+batch is cut in two: [the game's part, our copy into IN] -A-> GL (FortsGFX into OUT) -B-> [our copy back, cmdHud,
+the rest of the batch] with the game's semaphores and fence where they were, then an empty submit signals our slot's
+fence. The HUD and cursor are drawn by the game over FortsGFX, untouched; the lab's Hide HUD / photo mode drop the
+redirected draws. The present pass now only runs when the control panel or a message has something to draw (or
+everything, with `[Vulkan] SplitHud=0`). Menus, with no playfield, are left as they are. `vktest split` checks it:
+Forts' own SPIR-V, a "world" quad then a yellow quad under the HUD matrix, `[Vulkan] TestSplitAt=2` - the yellow
+comes out exactly (255, 255, 0), the world with the look.
+
 ## Vulkan, phase V1 — the bridge (looks, bloom and the control panel on Vulkan)
 
 FortsGFX's effects are GL, so instead of rewriting them for Vulkan, each Vulkan frame visits a GL context of ours
