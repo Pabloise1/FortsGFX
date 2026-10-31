@@ -23,10 +23,11 @@ Install:   double-click install.cmd (it finds Forts through Steam), then start F
 Uninstall: double-click uninstall.cmd, or delete opengl32.dll from the Forts folder.
 
 In game:   Insert = control panel, Home = Lab bar, F7 / F8 = change look, F9 = before / after,
-           End = photo mode.
+           End = photo mode. Change the keys in the control panel -> Keys.
 
-Forts has to use its OpenGL renderer (the default). Settings are saved in FortsGFX.ini in the Forts folder,
-logs in the FortsGFX folder there.
+OpenGL (Forts' default renderer) is fully supported. Vulkan (EnableVulkan = true) is new and still being tested:
+if anything looks wrong with it, switch Forts back to OpenGL, or add Effects=0 under [Vulkan] in FortsGFX.ini.
+Settings are saved in FortsGFX.ini in the Forts folder, logs in the FortsGFX folder there.
 "@ | Set-Content -Encoding utf8 (Join-Path $stage 'README.txt')
 
 $zip = Join-Path $root "dist\$name.zip"
