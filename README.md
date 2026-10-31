@@ -29,9 +29,10 @@ If Forts is somewhere Steam doesn't know about, run
 ### Requirements
 
 - Windows 10 or 11, 64-bit, and Forts on Steam.
-- Forts' **OpenGL** renderer (the default) is fully supported. **Vulkan** support is new and still being tested
-  in the source here (not in a download yet): it runs the same effects, but if anything looks wrong with
-  `EnableVulkan = true`, switch Forts back to OpenGL, or add `Effects=0` under `[Vulkan]` in `FortsGFX.ini`.
+- Forts' **OpenGL** renderer (the default) is fully supported. **Vulkan** support (since 1.1) is new and still
+  being tested: it runs the same effects, but if anything looks wrong with `EnableVulkan = true`, switch Forts
+  back to OpenGL, or add `Effects=0` under `[Vulkan]` in `FortsGFX.ini` - and please report it with
+  `FortsGFX\vulkan.log`.
 - A dedicated graphics card. FortsGFX has been built and tested on one PC so far (RTX 4080 SUPER at 4K).
   If it runs slowly, pick **Quality: Low** in the control panel. Reports from other hardware are very welcome.
 
