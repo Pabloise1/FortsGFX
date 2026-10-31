@@ -6,6 +6,31 @@ A proxy `opengl32.dll` for Forts. Windows loads it from the game folder instead 
 system one; it forwards every OpenGL call to the real `C:\Windows\System32\opengl32.dll`
 and adds a graphics layer on top.
 
+## Vulkan, phase V1 — the bridge (looks, bloom and the control panel on Vulkan)
+
+FortsGFX's effects are GL, so instead of rewriting them for Vulkan, each Vulkan frame visits a GL context of ours
+(`vulkan.cpp`, "the bridge"). The game's device is created with `VK_KHR_external_memory(_win32)` and
+`VK_KHR_external_semaphore(_win32)` added (only if the driver has them; otherwise as the game asked). On the first
+present a hidden window and GL context are made, checked to be on the same GPU (device UUIDs), and two images (IN,
+OUT) are made in Vulkan with exportable dedicated memory and imported into GL (`GL_EXT_memory_object_win32`), plus two
+shared semaphores (`GL_EXT_semaphore_win32`). Each present: Vulkan blits the swapchain image into IN, flipped so GL
+sees it the right way up, and signals A; GL waits on A, runs `GfxBridgeFrame` (IN -> OUT) and the control panel
+(`OverlayBridgeFrame`, input from the window of the Vulkan surface), signals B; Vulkan waits on B, blits OUT back
+(flipped again) and signals C, which the present waits on. Three command-buffer slots with fences; nothing else waits
+on the CPU. An sRGB swapchain gets sRGB shared images, read and written raw in GL (`SKIP_DECODE`). Device and
+swapchain destruction release everything of ours on them. Any failure turns the bridge off for the session and says
+why in vulkan.log and session.log.
+
+`GfxBridgeFrame` (gfx.cpp) copies IN into the world target with the masks cleared to "playfield everywhere, nothing
+solid or glowing" and runs `RunPost` with `g_bridge` set: no day/night, events, weather, world particles, snow,
+lightning, lighting, fog or materials (all need the world from the Vulkan draws, phase V2), so the look, bloom from
+the bright parts, grade, FXAA, sharpening, vignette and grain. F9 turns it off. Photo mode saves from OUT
+(`CapBridgePhoto`). Known gap: the game's HUD is in the image too, so it gets the look; separating it needs the draw
+stream (V0's dumps).
+
+Tested with `tools/vktest.cpp` (an orange `TestMark` square shows which way up the round trip comes out; `vktest
+srgb` uses an sRGB swapchain; `[Vulkan] ShotAfterEffects=1` / `DumpAt=1` in `build\FortsGFX.ini`).
+
 ## Vulkan, phase V0 — recon
 
 Forts' Vulkan renderer (`EnableVulkan = true` in `users\<id>\settings_hardware.lua`) is native Vulkan with its own

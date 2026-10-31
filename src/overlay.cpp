@@ -21,6 +21,8 @@ int imgl3wInit2(GL3WglProc (*proc)(const char*));
 }
 
 static HWND g_wnd;
+static HWND g_bridgeWnd;     // Vulkan: the game's window (there is no GL DC of the game's to find it from)
+static GLuint g_targetFbo;   // where the panel draws: 0 = the back buffer, else the shared Vulkan frame
 static WNDPROC g_prevProc;
 static bool g_init, g_open, g_failed;
 static float g_scale = 1.0f;
@@ -305,7 +307,7 @@ static void Theme() {
 }
 
 static bool Init() {
-    g_wnd = WindowFromDC(R.wglGetCurrentDC());
+    g_wnd = g_bridgeWnd ? g_bridgeWnd : WindowFromDC(R.wglGetCurrentDC());
     if (!g_wnd) return false;
     if (imgl3wInit2(LoadGl) != 0) { SessionLog("overlay: could not load GL functions"); return false; }
     RECT rc{};
@@ -1362,8 +1364,19 @@ void OverlayFrame() {
     DrawToast(fg, io.DisplaySize);
     ImGui::Render();
     auto bindFb = (void (WINAPI*)(GLenum, GLuint))RealProc("glBindFramebuffer");
-    if (bindFb) bindFb(GL_FRAMEBUFFER, 0);
+    if (bindFb) bindFb(GL_FRAMEBUFFER, g_targetFbo);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+}
+
+// Forts' Vulkan renderer (vulkan.cpp): the panel draws into the shared frame `fbo` of our own GL context, and its
+// input comes from `wnd`, the window Vulkan presents to.
+void OverlayToast(const char* text) { Toast("%s", text); }
+
+void OverlayBridgeFrame(HWND wnd, GLuint fbo) {
+    g_bridgeWnd = wnd;
+    g_targetFbo = fbo;
+    OverlayFrame();
+    g_targetFbo = 0;
 }
 
 #ifdef FORTSGFX_PREVIEW

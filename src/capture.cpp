@@ -660,9 +660,9 @@ static std::string g_benchLabel;
 static bool g_benchReq;
 void CapRequest(const char* label) { g_benchLabel = label ? label : ""; g_benchReq = true; }
 
-static void SavePhoto() {
+static void SavePhoto(bool backBuffer = true) {
     Image* img = new Image;
-    if (!ReadTarget(*img, 1, true)) { delete img; SessionLog("photo: could not read the frame"); return; }
+    if (!ReadTarget(*img, 1, backBuffer)) { delete img; SessionLog("photo: could not read the frame"); return; }
     std::wstring dir = g_outDir + L"Photos\\";
     CreateDirectoryW(dir.c_str(), nullptr);
     SYSTEMTIME st;
@@ -679,6 +679,16 @@ static void SavePhoto() {
         delete img;
         MessageBeep(ok ? MB_OK : MB_ICONHAND);
     }).detach();
+}
+
+// Forts' Vulkan renderer: photo mode saves the shared frame `fbo` of the bridge's GL context, before the control panel
+// draws over it.
+void CapBridgePhoto(GLuint fbo) {
+    if (!g_photoReq || !R.BindFramebuffer) return;
+    g_photoReq = false;
+    R.BindFramebuffer(GL_FRAMEBUFFER, fbo);
+    SavePhoto(false);
+    R.BindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
 // A frame read back by the Vulkan recon (vulkan.cpp): RGBA, top row first.

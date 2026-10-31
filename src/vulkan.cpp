@@ -2,12 +2,15 @@
 // for vkGetInstanceProcAddr through GetProcAddress; that call is hooked in Forts.exe's import table, so every Vulkan
 // function the game looks up can be wrapped here, from the same opengl32.dll.
 //
-// Phase V0 only watches. Nothing changes except that the swapchain may also be copied from (for the screenshot).
-// vulkan.log: the instance, device, swapchain, render passes, shaders, pipelines and descriptor layouts as they are
-// made, and every 10 s what an average frame does. loading.log: every image (VKIMG lines, with the file DevIL just
-// loaded). vk_frame_NN.txt: every command of one frame, the first vertices of each draw decoded, and vk_frame_NN.png:
-// that frame as presented - on Ctrl+Shift+F11, and by itself 10 s in and then once a minute, at most 8 in all.
-// [Vulkan] Hook=0 in FortsGFX.ini leaves Vulkan alone.
+// Recon (phase V0) watches: vulkan.log gets the instance, device, swapchain, render passes, shaders, pipelines and
+// descriptor layouts as they are made, and every 10 s what an average frame does. loading.log: every image (VKIMG
+// lines, with the file DevIL just loaded). vk_frame_NN.txt: every command of one frame, the first vertices of each
+// draw decoded, and vk_frame_NN.png: that frame as the game drew it - on Ctrl+Shift+F11, and by itself 10 s in and
+// then once a minute, at most 8 in all.
+//
+// The bridge (phase V1) puts FortsGFX on the Vulkan frames: each frame is shared with our own hidden GL context, where
+// gfx.cpp's image stages and the control panel run, and the result is copied back before it is presented (see below).
+// [Vulkan] Hook=0 in FortsGFX.ini leaves Vulkan alone; Effects=0 keeps the recon but not the bridge.
 #include "common.h"
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -35,6 +38,8 @@ static void VkLog(const char* fmt, ...) {
     fputc('\n', g_vlog);
     fflush(g_vlog);
 }
+
+static int IniInt(const wchar_t* key, int def) { return (int)GetPrivateProfileIntW(L"Vulkan", key, def, (g_gameDir + L"FortsGFX.ini").c_str()); }
 
 static double NowS() {
     static LARGE_INTEGER f, t0;
@@ -120,7 +125,7 @@ struct BufInfo { VkDeviceSize size; VkBufferUsageFlags usage; VkDeviceMemory mem
 struct MapInfo { uint8_t* ptr; VkDeviceSize off; };
 struct PipeInfo { int id; std::string shaders, blend; VkPrimitiveTopology topo; uint32_t stride[4]; std::vector<VkVertexInputAttributeDescription> attrs; };
 struct FbInfo { std::vector<VkImageView> views; uint32_t w, h; };
-struct SwapInfo { VkFormat fmt; uint32_t w, h; bool copyable; std::vector<VkImage> images; };
+struct SwapInfo { VkFormat fmt; uint32_t w, h; bool copyable, writable; HWND wnd; std::vector<VkImage> images; };
 struct CmdState {
     VkPipeline pipe = VK_NULL_HANDLE;
     VkBuffer vb[4] = {};
@@ -141,7 +146,9 @@ static std::unordered_map<VkRenderPass, std::string> g_rps;
 static std::unordered_map<VkFramebuffer, FbInfo> g_fbs;
 static std::unordered_map<VkQueue, uint32_t> g_queueFamily;
 static std::unordered_map<VkSwapchainKHR, SwapInfo> g_swaps;
+static std::unordered_map<VkSurfaceKHR, HWND> g_surfaceWnd;
 static std::unordered_map<VkCommandBuffer, CmdState> g_cmds;
+static bool g_interopExt;   // the external memory / semaphore extensions are on in the game's device
 static std::map<std::string, std::pair<size_t, uint64_t>> g_spv;   // the game's data\shaders\*.spv: size, hash
 
 static VkInstance g_inst;
@@ -171,8 +178,8 @@ static const uint8_t* BufPtr(VkBuffer b, VkDeviceSize off) {   // where the CPU 
 
 #define REAL(name) static PFN_##name r_##name
 REAL(vkGetInstanceProcAddr); REAL(vkGetDeviceProcAddr);
-REAL(vkCreateInstance); REAL(vkCreateDevice); REAL(vkGetDeviceQueue); REAL(vkGetDeviceQueue2);
-REAL(vkCreateSwapchainKHR); REAL(vkGetSwapchainImagesKHR); REAL(vkQueuePresentKHR);
+REAL(vkCreateInstance); REAL(vkCreateDevice); REAL(vkDestroyDevice); REAL(vkGetDeviceQueue); REAL(vkGetDeviceQueue2);
+REAL(vkCreateWin32SurfaceKHR); REAL(vkCreateSwapchainKHR); REAL(vkDestroySwapchainKHR); REAL(vkGetSwapchainImagesKHR); REAL(vkQueuePresentKHR);
 REAL(vkQueueSubmit); REAL(vkQueueSubmit2); REAL(vkQueueSubmit2KHR);
 REAL(vkCreateRenderPass); REAL(vkCreateRenderPass2); REAL(vkCreateRenderPass2KHR); REAL(vkCreateFramebuffer);
 REAL(vkCreateShaderModule); REAL(vkCreatePipelineLayout); REAL(vkCreateDescriptorSetLayout); REAL(vkCreateGraphicsPipelines);
@@ -200,6 +207,12 @@ static struct {
     PFN_vkDestroyBuffer DestroyBuffer; PFN_vkFreeMemory FreeMemory; PFN_vkDestroyCommandPool DestroyCommandPool;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
     bool ok;
+    // the bridge
+    PFN_vkCreateImage CreateImage; PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements; PFN_vkBindImageMemory BindImageMemory;
+    PFN_vkDestroyImage DestroyImage; PFN_vkCmdBlitImage CmdBlitImage; PFN_vkDestroySemaphore DestroySemaphore;
+    PFN_vkDestroyFence DestroyFence; PFN_vkQueueWaitIdle QueueWaitIdle; PFN_vkDeviceWaitIdle DeviceWaitIdle;
+    PFN_vkGetMemoryWin32HandleKHR GetMemoryWin32HandleKHR; PFN_vkGetSemaphoreWin32HandleKHR GetSemaphoreWin32HandleKHR;
+    bool bridge;
 } D;
 
 static void ResolveOwn() {
@@ -212,11 +225,16 @@ static void ResolveOwn() {
     OWN(AllocateMemory); OWN(BindBufferMemory); OWN(MapMemory); OWN(CreateSemaphore); OWN(CreateFence);
     OWN(WaitForFences); OWN(ResetFences); OWN(BeginCommandBuffer); OWN(EndCommandBuffer); OWN(CmdPipelineBarrier);
     OWN(CmdCopyImageToBuffer); OWN(QueueSubmit); OWN(ResetCommandBuffer); OWN(DestroyBuffer); OWN(FreeMemory);
-    OWN(DestroyCommandPool);
-#undef OWN
+    OWN(DestroyCommandPool); OWN(DestroyImage); OWN(DestroySemaphore); OWN(DestroyFence); OWN(DeviceWaitIdle);
     D.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)r_vkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceMemoryProperties");
     D.ok = D.ok && D.GetPhysicalDeviceMemoryProperties;
-    if (!D.ok) VkLog("screenshots off: a device function is missing");
+    if (!D.ok) { VkLog("screenshots and effects off: a device function is missing"); return; }
+    D.bridge = g_interopExt;
+#define OWN2(n) D.n = (PFN_vk##n)gdpa(g_dev, "vk" #n); D.bridge = D.bridge && D.n
+    OWN2(CreateImage); OWN2(GetImageMemoryRequirements); OWN2(BindImageMemory); OWN2(CmdBlitImage); OWN2(QueueWaitIdle);
+    OWN2(GetMemoryWin32HandleKHR); OWN2(GetSemaphoreWin32HandleKHR);
+#undef OWN2
+#undef OWN
 }
 
 // ---------------------------------------------------------------- frame statistics and the dump
@@ -378,6 +396,403 @@ static void ShotFinish(unsigned n) {
     CapSaveRgbaPng(g_outDir + Widen(Fmt("vk_frame_%02u.png", n)), (int)g_shotW, (int)g_shotH, std::move(px));
 }
 
+// ---------------------------------------------------------------- the bridge: FortsGFX on the Vulkan frames
+// Every frame, the image about to be presented is blitted (flipped, so GL sees it the right way up) into IN, an image
+// whose memory is shared with our own hidden GL context. There gfx.cpp runs its image stages from IN into OUT, the
+// second shared image, and the control panel draws over OUT; then OUT is blitted back (flipped again) into the
+// swapchain image and that is presented. Semaphores shared between the two APIs order it on the GPU: the game's
+// render -> [Vulkan: copy in] -A-> [GL: effects, panel] -B-> [Vulkan: copy back] -C-> present. Nothing waits on the
+// CPU except for a command buffer slot from three frames ago. Any failure turns the bridge off for the session.
+
+enum : GLenum {   // GL_EXT_memory_object(_win32) / GL_EXT_semaphore(_win32) and the few GL names used here
+    kGlTex2D = 0x0DE1, kGlRgba8 = 0x8058, kGlFramebuffer = 0x8D40, kGlReadFb = 0x8CA8, kGlDrawFb = 0x8CA9,
+    kGlColor0 = 0x8CE0, kGlFbComplete = 0x8CD5, kGlColorBit = 0x4000, kGlNearest = 0x2600, kGlLinear = 0x2601,
+    kGlMinFilter = 0x2801, kGlMagFilter = 0x2800, kGlScissorTest = 0x0C11,
+    kGlTilingExt = 0x9580, kGlOptimalTilingExt = 0x9584, kGlDedicatedExt = 0x9581, kGlHandleOpaqueWin32 = 0x9587,
+    kGlDeviceUuid = 0x9597, kGlLayoutTransferSrc = 0x9592, kGlLayoutTransferDst = 0x9593,
+    kGlSrgb8Alpha8 = 0x8C43, kGlSrgbDecodeExt = 0x8A48, kGlSkipDecodeExt = 0x8A4A,
+};
+static struct {
+    void (WINAPI* CreateMemoryObjectsEXT)(GLsizei, GLuint*);
+    void (WINAPI* DeleteMemoryObjectsEXT)(GLsizei, const GLuint*);
+    void (WINAPI* MemoryObjectParameterivEXT)(GLuint, GLenum, const GLint*);
+    void (WINAPI* ImportMemoryWin32HandleEXT)(GLuint, unsigned long long, GLenum, void*);
+    void (WINAPI* TexStorageMem2DEXT)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLuint, unsigned long long);
+    void (WINAPI* GenSemaphoresEXT)(GLsizei, GLuint*);
+    void (WINAPI* DeleteSemaphoresEXT)(GLsizei, const GLuint*);
+    void (WINAPI* ImportSemaphoreWin32HandleEXT)(GLuint, GLenum, void*);
+    void (WINAPI* WaitSemaphoreEXT)(GLuint, GLuint, const GLuint*, GLuint, const GLuint*, const GLenum*);
+    void (WINAPI* SignalSemaphoreEXT)(GLuint, GLuint, const GLuint*, GLuint, const GLuint*, const GLenum*);
+    void (WINAPI* GetUnsignedBytei_vEXT)(GLenum, GLuint, GLubyte*);
+    void (WINAPI* GenTextures)(GLsizei, GLuint*);
+    void (WINAPI* DeleteTextures)(GLsizei, const GLuint*);
+    void (WINAPI* BindTexture)(GLenum, GLuint);
+    void (WINAPI* TexParameteri)(GLenum, GLenum, GLint);
+    void (WINAPI* GenFramebuffers)(GLsizei, GLuint*);
+    void (WINAPI* DeleteFramebuffers)(GLsizei, const GLuint*);
+    void (WINAPI* BindFramebuffer)(GLenum, GLuint);
+    void (WINAPI* FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+    GLenum (WINAPI* CheckFramebufferStatus)(GLenum);
+    void (WINAPI* BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
+    void (WINAPI* Enable)(GLenum);
+    void (WINAPI* Disable)(GLenum);
+    void (WINAPI* Scissor)(GLint, GLint, GLsizei, GLsizei);
+    void (WINAPI* ClearColor)(GLfloat, GLfloat, GLfloat, GLfloat);
+    void (WINAPI* Clear)(GLbitfield);
+    void (WINAPI* Flush)();
+    GLenum (WINAPI* GetError)();
+    HGLRC (WINAPI* CreateContext)(HDC);
+    BOOL (WINAPI* MakeCurrent)(HDC, HGLRC);
+} GL;
+
+static struct {
+    bool tried, failed;
+    HWND glWnd; HDC glDC; HGLRC glRC;                 // our hidden GL context
+    VkSemaphore semA, semB, semC; GLuint glSemA, glSemB;
+    VkCommandPool pool; uint32_t family = ~0u;
+    VkCommandBuffer cmd1[3], cmd2[3]; VkFence fence[3]; int slot;
+    uint32_t w, h;                                    // the shared images, 0 = none yet
+    bool srgb;                                        // ... in an sRGB format, as the swapchain is
+    VkImage img[2]; VkDeviceMemory mem[2]; GLuint glMem[2], glTex[2], glFbo[2];
+    bool outKnown;                                    // OUT has been given a layout
+    bool testMark, shotAfter;                         // [Vulkan] TestMark: an orange square top left; ShotAfterEffects
+    unsigned frames;
+} B;
+
+static void BridgeFail(const char* why) {
+    B.failed = true;
+    VkLog("effects off: %s", why);
+    SessionLog("vulkan: FortsGFX effects off - %s", why);
+}
+
+// Our current GL context for the duration of a scope, the caller's back afterwards.
+struct GlCurrent {
+    HDC dc; HGLRC rc; bool ok;
+    GlCurrent() : dc(R.wglGetCurrentDC()), rc(R.wglGetCurrentContext()), ok(GL.MakeCurrent(B.glDC, B.glRC) != FALSE) {}
+    ~GlCurrent() { GL.MakeCurrent(dc, rc); }
+};
+
+// The hidden window and GL context, once per session (they outlive a device the game remakes).
+static bool BridgeGlContext() {
+    if (B.glRC) return true;
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"FortsGFXVulkanBridge";
+    RegisterClassW(&wc);
+    B.glWnd = CreateWindowExW(0, wc.lpszClassName, L"", WS_POPUP, 0, 0, 16, 16, nullptr, nullptr, wc.hInstance, nullptr);
+    B.glDC = B.glWnd ? GetDC(B.glWnd) : nullptr;
+    if (!B.glDC) { BridgeFail("could not make a window for GL"); return false; }
+    PIXELFORMATDESCRIPTOR pfd = { sizeof(pfd), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER, PFD_TYPE_RGBA, 32 };
+    int pf = ChoosePixelFormat(B.glDC, &pfd);
+    if (!pf || !SetPixelFormat(B.glDC, pf, &pfd)) { BridgeFail("no GL pixel format"); return false; }
+    GL.CreateContext = (decltype(GL.CreateContext))RealProc("wglCreateContext");
+    GL.MakeCurrent = (decltype(GL.MakeCurrent))RealProc("wglMakeCurrent");
+    B.glRC = GL.CreateContext ? GL.CreateContext(B.glDC) : nullptr;
+    if (!B.glRC) { BridgeFail("could not make a GL context"); return false; }
+    GlCurrent cur;
+    if (!cur.ok) { BridgeFail("could not use the GL context"); return false; }
+    LoadRealExt();   // capture.cpp's reads (photo mode) in this context
+    bool ok = true;
+#define P(n) GL.n = (decltype(GL.n))RealProc("gl" #n); ok = ok && GL.n
+    P(CreateMemoryObjectsEXT); P(DeleteMemoryObjectsEXT); P(MemoryObjectParameterivEXT); P(ImportMemoryWin32HandleEXT);
+    P(TexStorageMem2DEXT); P(GenSemaphoresEXT); P(DeleteSemaphoresEXT); P(ImportSemaphoreWin32HandleEXT); P(WaitSemaphoreEXT);
+    P(SignalSemaphoreEXT); P(GetUnsignedBytei_vEXT); P(GenTextures); P(DeleteTextures); P(BindTexture); P(TexParameteri);
+    P(GenFramebuffers); P(DeleteFramebuffers); P(BindFramebuffer); P(FramebufferTexture2D); P(CheckFramebufferStatus);
+    P(BlitFramebuffer); P(Enable); P(Disable); P(Scissor); P(ClearColor); P(Clear); P(Flush); P(GetError);
+#undef P
+    const char* renderer = (const char*)R.GetString(0x1F01);
+    VkLog("effects: GL context on %s", renderer ? renderer : "?");
+    if (!ok) { BridgeFail("the GL driver can't share images with Vulkan (GL_EXT_memory_object_win32 / GL_EXT_semaphore_win32)"); return false; }
+    return true;
+}
+
+// Per device: the GPUs must match, and the semaphores are made and shared.
+static bool BridgeGlInit() {
+    if (!BridgeGlContext()) return false;
+    GlCurrent cur;
+
+    // GL and Vulkan must be on the same GPU (laptops have two)
+    VkPhysicalDeviceIDProperties idp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+    VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &idp };
+    auto gpp2 = (PFN_vkGetPhysicalDeviceProperties2)r_vkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceProperties2");
+    if (!gpp2) gpp2 = (PFN_vkGetPhysicalDeviceProperties2)r_vkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceProperties2KHR");
+    GLubyte glUuid[16] = {};
+    GL.GetUnsignedBytei_vEXT(kGlDeviceUuid, 0, glUuid);
+    if (gpp2) {
+        gpp2(g_phys, &p2);
+        if (memcmp(idp.deviceUUID, glUuid, 16) != 0) { BridgeFail("GL and Vulkan are on different GPUs"); return false; }
+        VkLog("effects: GL and Vulkan are on the same GPU");
+    } else VkLog("effects: could not compare the GPUs of GL and Vulkan (no vkGetPhysicalDeviceProperties2)");
+
+    // the semaphores A (Vulkan -> GL) and B (GL -> Vulkan) are shared, C (-> present) is Vulkan's own
+    VkSemaphoreCreateInfo plain = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    VkExportSemaphoreCreateInfo exp = { VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO, nullptr, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT };
+    VkSemaphoreCreateInfo shared = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &exp };
+    VkSemaphore* vs[2] = { &B.semA, &B.semB };
+    GLuint* gs[2] = { &B.glSemA, &B.glSemB };
+    for (int i = 0; i < 2; i++) {
+        if (D.CreateSemaphore(g_dev, &shared, nullptr, vs[i]) != VK_SUCCESS) { BridgeFail("could not make a shared semaphore"); return false; }
+        VkSemaphoreGetWin32HandleInfoKHR gi = { VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR, nullptr, *vs[i], VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT };
+        HANDLE h = nullptr;
+        if (D.GetSemaphoreWin32HandleKHR(g_dev, &gi, &h) != VK_SUCCESS || !h) { BridgeFail("could not share a semaphore"); return false; }
+        GL.GenSemaphoresEXT(1, gs[i]);
+        GL.ImportSemaphoreWin32HandleEXT(*gs[i], kGlHandleOpaqueWin32, h);
+        CloseHandle(h);   // importing doesn't take the handle over
+    }
+    if (D.CreateSemaphore(g_dev, &plain, nullptr, &B.semC) != VK_SUCCESS) { BridgeFail("could not make a semaphore"); return false; }
+    if (GLenum e = GL.GetError()) { BridgeFail(Fmt("GL error 0x%x sharing the semaphores", e).c_str()); return false; }
+    B.testMark = IniInt(L"TestMark", 0) != 0;
+    B.shotAfter = IniInt(L"ShotAfterEffects", 0) != 0;
+    return true;
+}
+
+static bool BridgeCommands(uint32_t family) {
+    if (B.family == family) return true;
+    if (B.pool) { BridgeFail("the present queue changed family"); return false; }
+    VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, family };
+    if (D.CreateCommandPool(g_dev, &pci, nullptr, &B.pool) != VK_SUCCESS) { BridgeFail("could not make a command pool"); return false; }
+    VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, B.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 3 };
+    if (D.AllocateCommandBuffers(g_dev, &ai, B.cmd1) != VK_SUCCESS || D.AllocateCommandBuffers(g_dev, &ai, B.cmd2) != VK_SUCCESS) {
+        BridgeFail("could not make command buffers");
+        return false;
+    }
+    for (int i = 0; i < 3; i++) {
+        *(void**)B.cmd1[i] = *(void**)g_dev;   // our own command buffers need the loader's dispatch table
+        *(void**)B.cmd2[i] = *(void**)g_dev;
+        VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT };
+        if (D.CreateFence(g_dev, &fci, nullptr, &B.fence[i]) != VK_SUCCESS) { BridgeFail("could not make a fence"); return false; }
+    }
+    B.family = family;
+    return true;
+}
+
+static void BridgeFreeImages(VkQueue q) {
+    if (!B.w) return;
+    D.QueueWaitIdle(q);
+    {
+        GlCurrent cur;
+        GL.DeleteFramebuffers(2, B.glFbo);
+        GL.DeleteTextures(2, B.glTex);
+        GL.DeleteMemoryObjectsEXT(2, B.glMem);
+    }
+    for (int i = 0; i < 2; i++) { D.DestroyImage(g_dev, B.img[i], nullptr); D.FreeMemory(g_dev, B.mem[i], nullptr); }
+    B.w = B.h = 0;
+    B.outKnown = false;
+}
+
+// IN and OUT, the swapchain's size. With an sRGB swapchain they are sRGB too, so the blits keep the game's values as
+// they are, and GL reads and writes them raw (no decoding, no GL_FRAMEBUFFER_SRGB): FortsGFX sees what it sees in GL.
+static bool BridgeImages(VkQueue q, uint32_t w, uint32_t h, bool srgb) {
+    if (B.w == w && B.h == h && B.srgb == srgb) return true;
+    BridgeFreeImages(q);
+    VkPhysicalDeviceMemoryProperties mp;
+    D.GetPhysicalDeviceMemoryProperties(g_phys, &mp);
+    GlCurrent cur;
+    for (int i = 0; i < 2; i++) {
+        VkExternalMemoryImageCreateInfo ext = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT };
+        VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ext, 0, VK_IMAGE_TYPE_2D,
+                                  srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, { w, h, 1 }, 1, 1,
+                                  VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                  VK_SHARING_MODE_EXCLUSIVE, 0, nullptr, VK_IMAGE_LAYOUT_UNDEFINED };
+        if (D.CreateImage(g_dev, &ici, nullptr, &B.img[i]) != VK_SUCCESS) { BridgeFail("could not make a shared image"); return false; }
+        VkMemoryRequirements req;
+        D.GetImageMemoryRequirements(g_dev, B.img[i], &req);
+        uint32_t type = ~0u;
+        for (uint32_t t = 0; t < mp.memoryTypeCount && type == ~0u; t++)
+            if ((req.memoryTypeBits & (1u << t)) && (mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = t;
+        VkExportMemoryAllocateInfo exp = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT };
+        VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &exp, B.img[i], VK_NULL_HANDLE };
+        VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ded, req.size, type };
+        if (type == ~0u || D.AllocateMemory(g_dev, &mai, nullptr, &B.mem[i]) != VK_SUCCESS || D.BindImageMemory(g_dev, B.img[i], B.mem[i], 0) != VK_SUCCESS) {
+            BridgeFail("could not give a shared image memory");
+            return false;
+        }
+        VkMemoryGetWin32HandleInfoKHR gi = { VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR, nullptr, B.mem[i], VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT };
+        HANDLE hnd = nullptr;
+        if (D.GetMemoryWin32HandleKHR(g_dev, &gi, &hnd) != VK_SUCCESS || !hnd) { BridgeFail("could not share an image's memory"); return false; }
+        while (GL.GetError()) {}
+        GLenum e1, e2, e3, e4;
+        GL.CreateMemoryObjectsEXT(1, &B.glMem[i]);
+        GLint dedicated = 1;
+        GL.MemoryObjectParameterivEXT(B.glMem[i], kGlDedicatedExt, &dedicated);
+        e1 = GL.GetError();
+        GL.ImportMemoryWin32HandleEXT(B.glMem[i], req.size, kGlHandleOpaqueWin32, hnd);
+        e2 = GL.GetError();
+        CloseHandle(hnd);
+        GL.GenTextures(1, &B.glTex[i]);
+        GL.BindTexture(kGlTex2D, B.glTex[i]);
+        GL.TexParameteri(kGlTex2D, kGlTilingExt, kGlOptimalTilingExt);
+        GL.TexParameteri(kGlTex2D, kGlMinFilter, kGlLinear);
+        GL.TexParameteri(kGlTex2D, kGlMagFilter, kGlLinear);
+        e3 = GL.GetError();
+        GL.TexStorageMem2DEXT(kGlTex2D, 1, srgb ? kGlSrgb8Alpha8 : kGlRgba8, (GLsizei)w, (GLsizei)h, B.glMem[i], 0);
+        e4 = GL.GetError();
+        if (srgb) GL.TexParameteri(kGlTex2D, kGlSrgbDecodeExt, kGlSkipDecodeExt);
+        GL.GenFramebuffers(1, &B.glFbo[i]);
+        GL.BindFramebuffer(kGlFramebuffer, B.glFbo[i]);
+        GL.FramebufferTexture2D(kGlFramebuffer, kGlColor0, kGlTex2D, B.glTex[i], 0);
+        GLenum status = GL.CheckFramebufferStatus(kGlFramebuffer);
+        GL.BindFramebuffer(kGlFramebuffer, 0);
+        GL.BindTexture(kGlTex2D, 0);
+        if (status != kGlFbComplete || e1 || e2 || e3 || e4) {
+            VkLog("effects: shared image %d (%llu bytes): GL errors 0x%x / import 0x%x / parameters 0x%x / storage 0x%x, framebuffer 0x%x",
+                  i, (unsigned long long)req.size, e1, e2, e3, e4, status);
+            if (status != kGlFbComplete) { BridgeFail("a shared image can't be drawn into in GL"); return false; }
+        }
+    }
+    if (GLenum e = GL.GetError()) { BridgeFail(Fmt("GL error 0x%x sharing the images", e).c_str()); return false; }
+    B.w = w; B.h = h; B.srgb = srgb;
+    VkLog("effects: shared images %ux%u%s ready", w, h, srgb ? " sRGB" : "");
+    return true;
+}
+
+static void Barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to, VkAccessFlags srcA, VkAccessFlags dstA,
+                    VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, srcA, dstA, from, to, VK_QUEUE_FAMILY_IGNORED,
+                               VK_QUEUE_FAMILY_IGNORED, img, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    D.CmdPipelineBarrier(cb, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+static void BlitFlipped(VkCommandBuffer cb, VkImage src, VkImage dst, int32_t w, int32_t h) {
+    VkImageBlit r = {};
+    r.srcSubresource = r.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    r.srcOffsets[1] = { w, h, 1 };
+    r.dstOffsets[0] = { 0, h, 0 };
+    r.dstOffsets[1] = { w, 0, 1 };
+    D.CmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r, VK_FILTER_NEAREST);
+}
+
+// Runs FortsGFX on the image `pi` presents; `mod` is then what to present instead (it waits for our copy back).
+static bool BridgeFrame(VkQueue q, const VkPresentInfoKHR* pi, VkPresentInfoKHR& mod) {
+    if (B.failed || pi->swapchainCount != 1) return false;
+    SwapInfo s;
+    uint32_t family;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        auto sw = g_swaps.find(pi->pSwapchains[0]);
+        auto qf = g_queueFamily.find(q);
+        if (sw == g_swaps.end() || qf == g_queueFamily.end() || pi->pImageIndices[0] >= sw->second.images.size()) return false;
+        s = sw->second;
+        family = qf->second;
+    }
+    if (!B.tried) {
+        B.tried = true;
+        if (!IniInt(L"Effects", 1)) { B.failed = true; VkLog("effects: [Vulkan] Effects=0"); return false; }
+        if (!D.ok || !D.bridge) { BridgeFail("the Vulkan driver can't share images with GL"); return false; }
+        if (!BridgeGlInit()) return false;
+        VkLog("effects: bridge ready");
+        SessionLog("vulkan: FortsGFX effects on (image stages and the control panel)");
+    }
+    bool srgb = s.fmt == VK_FORMAT_B8G8R8A8_SRGB || s.fmt == VK_FORMAT_R8G8B8A8_SRGB;
+    if (!srgb && s.fmt != VK_FORMAT_B8G8R8A8_UNORM && s.fmt != VK_FORMAT_R8G8B8A8_UNORM) {
+        BridgeFail(Fmt("swapchain format %s not handled yet", FormatName(s.fmt).c_str()).c_str());
+        return false;
+    }
+    if (!s.copyable || !s.writable) { BridgeFail("the swapchain can't be copied to and from"); return false; }
+    if (!BridgeCommands(family) || !BridgeImages(q, s.w, s.h, srgb)) return false;
+    VkImage swapImg = s.images[pi->pImageIndices[0]];
+    int32_t w = (int32_t)s.w, h = (int32_t)s.h;
+    int k = B.slot = (B.slot + 1) % 3;
+    D.WaitForFences(g_dev, 1, &B.fence[k], VK_TRUE, 2000000000ull);
+    D.ResetFences(g_dev, 1, &B.fence[k]);
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+
+    // 1. the game's image -> IN
+    VkCommandBuffer c1 = B.cmd1[k];
+    D.ResetCommandBuffer(c1, 0);
+    D.BeginCommandBuffer(c1, &bi);
+    Barrier(c1, swapImg, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    Barrier(c1, B.img[0], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    if (!B.outKnown) {
+        Barrier(c1, B.img[1], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, 0,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        B.outKnown = true;
+    }
+    BlitFlipped(c1, swapImg, B.img[0], w, h);
+    D.EndCommandBuffer(c1);
+    std::vector<VkPipelineStageFlags> stages(pi->waitSemaphoreCount, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkSubmitInfo s1 = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, pi->waitSemaphoreCount, pi->pWaitSemaphores, stages.data(), 1, &c1, 1, &B.semA };
+    if (D.QueueSubmit(q, 1, &s1, VK_NULL_HANDLE) != VK_SUCCESS) { BridgeFail("a submit failed"); return false; }
+
+    // 2. GL: IN -> FortsGFX -> OUT, the control panel over it
+    {
+        GlCurrent cur;
+        const GLenum inLayouts[2] = { kGlLayoutTransferDst, kGlLayoutTransferSrc };
+        GL.WaitSemaphoreEXT(B.glSemA, 0, nullptr, 2, B.glTex, inLayouts);
+        if (!GfxBridgeFrame(B.glTex[0], B.glFbo[1], w, h)) {   // FortsGFX off (F9): the frame as it was
+            GL.BindFramebuffer(kGlReadFb, B.glFbo[0]);
+            GL.BindFramebuffer(kGlDrawFb, B.glFbo[1]);
+            GL.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, kGlColorBit, kGlNearest);
+            GL.BindFramebuffer(kGlFramebuffer, 0);
+        }
+        CapBridgePhoto(B.glFbo[1]);
+        OverlayBridgeFrame(s.wnd, B.glFbo[1]);
+        if (B.testMark) {   // tools/vktest: which way up the round trip comes out
+            GL.BindFramebuffer(kGlFramebuffer, B.glFbo[1]);
+            GL.Enable(kGlScissorTest);
+            GL.Scissor(16, h - 80, 64, 64);
+            GL.ClearColor(1.0f, 0.55f, 0.1f, 1.0f);
+            GL.Clear(kGlColorBit);
+            GL.Disable(kGlScissorTest);
+            GL.BindFramebuffer(kGlFramebuffer, 0);
+        }
+        const GLenum outLayouts[2] = { kGlLayoutTransferDst, kGlLayoutTransferSrc };
+        GL.SignalSemaphoreEXT(B.glSemB, 0, nullptr, 2, B.glTex, outLayouts);
+        GL.Flush();
+    }
+
+    // 3. OUT -> the game's image, which is then presented
+    VkCommandBuffer c2 = B.cmd2[k];
+    D.ResetCommandBuffer(c2, 0);
+    D.BeginCommandBuffer(c2, &bi);
+    Barrier(c2, swapImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    BlitFlipped(c2, B.img[1], swapImg, w, h);
+    Barrier(c2, swapImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    D.EndCommandBuffer(c2);
+    VkPipelineStageFlags st2 = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo s2 = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 1, &B.semB, &st2, 1, &c2, 1, &B.semC };
+    if (D.QueueSubmit(q, 1, &s2, B.fence[k]) != VK_SUCCESS) { BridgeFail("a submit failed"); return false; }
+    mod = *pi;
+    mod.waitSemaphoreCount = 1;
+    mod.pWaitSemaphores = &B.semC;
+    if (++B.frames == 1) {
+        VkLog("effects: first frame through FortsGFX");
+        OverlayToast("FortsGFX on Vulkan: looks, bloom and the control panel");
+    }
+    return true;
+}
+
+// The game is about to destroy its device: everything of ours made on it goes first. The GL context stays for the
+// next device, and the bridge sets itself up again on that one's first frame.
+static void DeviceGone() {
+    if (!D.ok) return;
+    D.DeviceWaitIdle(g_dev);
+    if (B.glRC && (B.w || B.glSemA)) {
+        GlCurrent cur;
+        if (B.w) { GL.DeleteFramebuffers(2, B.glFbo); GL.DeleteTextures(2, B.glTex); GL.DeleteMemoryObjectsEXT(2, B.glMem); }
+        const GLuint sems[2] = { B.glSemA, B.glSemB };
+        if (B.glSemA) GL.DeleteSemaphoresEXT(2, sems);
+    }
+    for (int i = 0; i < 2 && B.w; i++) { D.DestroyImage(g_dev, B.img[i], nullptr); D.FreeMemory(g_dev, B.mem[i], nullptr); }
+    for (VkSemaphore s : { B.semA, B.semB, B.semC, g_shotSem }) if (s) D.DestroySemaphore(g_dev, s, nullptr);
+    for (VkFence f : { B.fence[0], B.fence[1], B.fence[2], g_shotFence }) if (f) D.DestroyFence(g_dev, f, nullptr);
+    for (VkCommandPool p : { B.pool, g_shotPool }) if (p) D.DestroyCommandPool(g_dev, p, nullptr);
+    if (g_shotBuf) { D.DestroyBuffer(g_dev, g_shotBuf, nullptr); D.FreeMemory(g_dev, g_shotMem, nullptr); }
+    HWND wnd = B.glWnd; HDC dc = B.glDC; HGLRC rc = B.glRC;
+    bool mark = B.testMark, after = B.shotAfter;
+    B = decltype(B)();
+    B.glWnd = wnd; B.glDC = dc; B.glRC = rc; B.testMark = mark; B.shotAfter = after;
+    g_shotPool = VK_NULL_HANDLE; g_shotFamily = ~0u; g_shotCmd = VK_NULL_HANDLE; g_shotFence = VK_NULL_HANDLE;
+    g_shotSem = VK_NULL_HANDLE; g_shotBuf = VK_NULL_HANDLE; g_shotMem = VK_NULL_HANDLE; g_shotSize = 0; g_shotPtr = nullptr;
+    D.ok = D.bridge = false;
+    VkLog("the game destroys its device: FortsGFX's objects on it released");
+}
+
 // ---------------------------------------------------------------- instance and device
 
 static VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateInstance(const VkInstanceCreateInfo* ci, const VkAllocationCallbacks* a, VkInstance* out) {
@@ -395,9 +810,38 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateInstance(const VkInstanceCreate
     return r;
 }
 
+// The bridge shares images and semaphores with GL: the game's device gets the extensions for that when the driver has
+// them (and is made as the game asked if that fails).
+static const char* kInteropExt[] = { "VK_KHR_external_memory", "VK_KHR_external_memory_win32", "VK_KHR_external_semaphore",
+                                     "VK_KHR_external_semaphore_win32" };
+
 static VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci, const VkAllocationCallbacks* a, VkDevice* out) {
-    VkResult r = r_vkCreateDevice(pd, ci, a, out);
+    VkDeviceCreateInfo c = *ci;
+    std::vector<const char*> exts(ci->ppEnabledExtensionNames, ci->ppEnabledExtensionNames + ci->enabledExtensionCount);
+    bool interop = false;
+    if (IniInt(L"Effects", 1)) {
+        std::vector<VkExtensionProperties> have;
+        uint32_t n = 0;
+        auto enumExt = (PFN_vkEnumerateDeviceExtensionProperties)r_vkGetInstanceProcAddr(g_inst, "vkEnumerateDeviceExtensionProperties");
+        if (enumExt && enumExt(pd, nullptr, &n, nullptr) == VK_SUCCESS) { have.resize(n); enumExt(pd, nullptr, &n, have.data()); }
+        interop = true;
+        for (const char* e : kInteropExt) {
+            bool supported = false, on = false;
+            for (auto& h : have) supported = supported || !strcmp(h.extensionName, e);
+            for (const char* x : exts) on = on || !strcmp(x, e);
+            if (!supported) { interop = false; VkLog("effects off: the driver has no %s", e); break; }
+            if (!on) exts.push_back(e);
+        }
+        if (interop) { c.enabledExtensionCount = (uint32_t)exts.size(); c.ppEnabledExtensionNames = exts.data(); }
+    }
+    VkResult r = r_vkCreateDevice(pd, &c, a, out);
+    if (r != VK_SUCCESS && interop) {
+        VkLog("vkCreateDevice with the sharing extensions -> %d: made as the game asked, effects off", r);
+        r = r_vkCreateDevice(pd, ci, a, out);
+        interop = false;
+    }
     std::lock_guard<std::recursive_mutex> lk(g_mx);
+    g_interopExt = interop && r == VK_SUCCESS;
     VkPhysicalDeviceProperties props = {};
     if (auto gpp = (PFN_vkGetPhysicalDeviceProperties)r_vkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceProperties")) gpp(pd, &props);
     std::string ext, queues, chain;
@@ -416,7 +860,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateDevice(VkPhysicalDevice pd, con
           VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion), queues.c_str(), ext.c_str(),
           chain.empty() ? " none" : chain.c_str());
     if (r == VK_SUCCESS) { g_phys = pd; g_dev = *out; ResolveOwn(); }
+    if (g_interopExt) VkLog("effects: the device can share images and semaphores with GL%s", D.bridge ? "" : " - but a function is missing");
     return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL hk_vkDestroyDevice(VkDevice d, const VkAllocationCallbacks* a) {
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        if (d && d == g_dev) {
+            DeviceGone();
+            g_dev = VK_NULL_HANDLE;
+            g_swaps.clear();
+            g_queueFamily.clear();
+            g_cmds.clear();
+        }
+    }
+    r_vkDestroyDevice(d, a);
 }
 
 static VKAPI_ATTR void VKAPI_CALL hk_vkGetDeviceQueue(VkDevice d, uint32_t family, uint32_t index, VkQueue* q) {
@@ -433,25 +892,45 @@ static VKAPI_ATTR void VKAPI_CALL hk_vkGetDeviceQueue2(VkDevice d, const VkDevic
 
 // ---------------------------------------------------------------- swapchain and frames
 
-static bool SurfaceAllowsCopy(VkSurfaceKHR surface) {
-    auto caps = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)r_vkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
-    VkSurfaceCapabilitiesKHR c = {};
-    return caps && g_phys && caps(g_phys, surface, &c) == VK_SUCCESS && (c.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+static VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateWin32SurfaceKHR(VkInstance inst, const VkWin32SurfaceCreateInfoKHR* ci, const VkAllocationCallbacks* a, VkSurfaceKHR* out) {
+    VkResult r = r_vkCreateWin32SurfaceKHR(inst, ci, a, out);
+    std::lock_guard<std::recursive_mutex> lk(g_mx);
+    if (r == VK_SUCCESS) g_surfaceWnd[*out] = ci->hwnd;
+    char title[128] = "";
+    GetWindowTextA(ci->hwnd, title, sizeof(title));
+    VkLog("vkCreateWin32SurfaceKHR -> %d: window '%s'", r, title);
+    return r;
 }
 
+static VkImageUsageFlags SurfaceUsage(VkSurfaceKHR surface) {
+    auto caps = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)r_vkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    VkSurfaceCapabilitiesKHR c = {};
+    return caps && g_phys && caps(g_phys, surface, &c) == VK_SUCCESS ? c.supportedUsageFlags : 0;
+}
+
+// The swapchain images can also be copied from (screenshots, the bridge) and to (the bridge), when the surface allows it.
 static VKAPI_ATTR VkResult VKAPI_CALL hk_vkCreateSwapchainKHR(VkDevice d, const VkSwapchainCreateInfoKHR* ci, const VkAllocationCallbacks* a, VkSwapchainKHR* out) {
     VkSwapchainCreateInfoKHR c = *ci;
-    bool copyable = (c.imageUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
-    if (!copyable && SurfaceAllowsCopy(c.surface)) { c.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT; copyable = true; }
+    c.imageUsage |= SurfaceUsage(c.surface) & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     VkResult r = r_vkCreateSwapchainKHR(d, &c, a, out);
-    if (r != VK_SUCCESS && c.imageUsage != ci->imageUsage) { r = r_vkCreateSwapchainKHR(d, ci, a, out); copyable = false; }   // as asked
+    if (r != VK_SUCCESS && c.imageUsage != ci->imageUsage) { r = r_vkCreateSwapchainKHR(d, ci, a, out); c.imageUsage = ci->imageUsage; }   // as asked
     std::lock_guard<std::recursive_mutex> lk(g_mx);
-    VkLog("vkCreateSwapchainKHR -> %d: %ux%u %s colour space %d, %u images min, usage %s%s, present mode %d, composite %d, clipped %u",
+    VkImageUsageFlags added = c.imageUsage & ~ci->imageUsage;
+    VkLog("vkCreateSwapchainKHR -> %d: %ux%u %s colour space %d, %u images min, usage %s%s%s, present mode %d, composite %d, clipped %u",
           r, ci->imageExtent.width, ci->imageExtent.height, FormatName(ci->imageFormat).c_str(), (int)ci->imageColorSpace,
-          ci->minImageCount, UsageName(ci->imageUsage).c_str(), copyable && !(ci->imageUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ? " (+TRANSFER_SRC for screenshots)" : "",
+          ci->minImageCount, UsageName(ci->imageUsage).c_str(), added ? " + " : "", added ? UsageName(added).c_str() : "",
           (int)ci->presentMode, (int)ci->compositeAlpha, ci->clipped);
-    if (r == VK_SUCCESS) g_swaps[*out] = { ci->imageFormat, ci->imageExtent.width, ci->imageExtent.height, copyable, {} };
+    if (r == VK_SUCCESS) {
+        auto w = g_surfaceWnd.find(ci->surface);
+        g_swaps[*out] = { ci->imageFormat, ci->imageExtent.width, ci->imageExtent.height, (c.imageUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0,
+                          (c.imageUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0, w != g_surfaceWnd.end() ? w->second : nullptr, {} };
+    }
     return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL hk_vkDestroySwapchainKHR(VkDevice d, VkSwapchainKHR sc, const VkAllocationCallbacks* a) {
+    { std::lock_guard<std::recursive_mutex> lk(g_mx); g_swaps.erase(sc); }
+    r_vkDestroySwapchainKHR(d, sc, a);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL hk_vkGetSwapchainImagesKHR(VkDevice d, VkSwapchainKHR sc, uint32_t* n, VkImage* imgs) {
@@ -494,7 +973,12 @@ static void Summary(double now) {
 static VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR* pi) {
     std::unique_lock<std::recursive_mutex> lk(g_mx);
     double now = NowS();
-    if (g_lastPresent < 0) { VkLog("first frame presented"); SessionLog("vulkan: Forts is drawing with Vulkan - FortsGFX recon in vulkan.log"); g_lastSummary = now; }
+    if (g_lastPresent < 0) {
+        VkLog("first frame presented");
+        SessionLog("vulkan: Forts is drawing with Vulkan - FortsGFX recon in vulkan.log");
+        g_lastSummary = now;
+        g_nextAutoDump = now + IniInt(L"DumpAt", 10);   // seconds to the first automatic dump
+    }
     else {
         double ms = (now - g_lastPresent) * 1000.0;
         g_windowMs += ms;
@@ -508,8 +992,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPr
     g_frame = {};
     g_frameNo++;
 
-    VkPresentInfoKHR mod;
-    bool shot = false;
+    // what is presented: the game's image, copied out for a dump first, then through the bridge (or the other way
+    // round with [Vulkan] ShotAfterEffects=1); each step waits for the one before
+    const VkPresentInfoKHR* cur = pi;
+    VkPresentInfoKHR shotMod, bridgeMod;
+    bool shot = false, shotLater = false;
     unsigned dumped = 0;
     if (g_dumpRec) {   // the dumped frame is complete: its commands, then this image
         for (auto& c : g_cmds) if (!c.second.lines.empty()) FlushCmd("recorded, not submitted", ~0u, c.first);
@@ -518,13 +1005,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_vkQueuePresentKHR(VkQueue q, const VkPr
         if (FILE* f = _wfopen(path.c_str(), L"wb")) { fwrite(g_dumpText.data(), 1, g_dumpText.size(), f); fclose(f); }
         g_dumpText.clear();
         g_dumpRec = false;
-        shot = ShotStart(q, pi, mod);
-        VkLog("frame %u written to vk_frame_%02u.txt%s", g_dumpFrame, dumped, shot ? " (+ .png)" : " (no screenshot)");
+        if (B.shotAfter) shotLater = true;
+        else if ((shot = ShotStart(q, cur, shotMod))) cur = &shotMod;
+        VkLog("frame %u written to vk_frame_%02u.txt", g_dumpFrame, dumped);
     }
     lk.unlock();
-    VkResult r = r_vkQueuePresentKHR(q, shot ? &mod : pi);
+    if (BridgeFrame(q, cur, bridgeMod)) cur = &bridgeMod;
+    if (shotLater) { lk.lock(); if ((shot = ShotStart(q, cur, shotMod))) cur = &shotMod; lk.unlock(); }
+    VkResult r = r_vkQueuePresentKHR(q, cur);
     lk.lock();
     if (shot) ShotFinish(dumped);
+    else if (dumped) VkLog("no screenshot of that frame");
 
     static bool keyPrev;
     DWORD pid = 0;
@@ -1040,8 +1531,8 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hk_vkGetDeviceProcAddr(VkDevice 
 struct Hook { const char* name; PFN_vkVoidFunction hook; PFN_vkVoidFunction* real; };
 #define HK(n) { #n, (PFN_vkVoidFunction)hk_##n, (PFN_vkVoidFunction*)&r_##n }
 static const Hook kHooks[] = {
-    HK(vkGetDeviceProcAddr), HK(vkCreateInstance), HK(vkCreateDevice), HK(vkGetDeviceQueue), HK(vkGetDeviceQueue2),
-    HK(vkCreateSwapchainKHR), HK(vkGetSwapchainImagesKHR), HK(vkQueuePresentKHR),
+    HK(vkGetDeviceProcAddr), HK(vkCreateInstance), HK(vkCreateDevice), HK(vkDestroyDevice), HK(vkGetDeviceQueue), HK(vkGetDeviceQueue2),
+    HK(vkCreateWin32SurfaceKHR), HK(vkCreateSwapchainKHR), HK(vkDestroySwapchainKHR), HK(vkGetSwapchainImagesKHR), HK(vkQueuePresentKHR),
     HK(vkQueueSubmit), HK(vkQueueSubmit2), HK(vkQueueSubmit2KHR),
     HK(vkCreateRenderPass), HK(vkCreateRenderPass2), HK(vkCreateRenderPass2KHR), HK(vkCreateFramebuffer),
     HK(vkCreateShaderModule), HK(vkCreatePipelineLayout), HK(vkCreateDescriptorSetLayout), HK(vkCreateGraphicsPipelines),

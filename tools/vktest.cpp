@@ -9,6 +9,7 @@
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include <GL/gl.h>
 
@@ -20,7 +21,8 @@ static VkDevice dev;
 #define IFN(n) auto n = (PFN_##n)gipa(inst, #n)
 #define DFN(n) auto n = (PFN_##n)gdpa(dev, #n)
 
-int main() {
+int main(int argc, char** argv) {
+    VkFormat fmt = argc > 1 && !strcmp(argv[1], "srgb") ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;   // vktest srgb: an sRGB swapchain
     glFlush();   // a real import of opengl32.dll, so FortsGFX's loads as it does in Forts
     HWND wnd = CreateWindowExW(0, L"STATIC", L"FortsGFX vktest", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 800, 450, nullptr, nullptr, nullptr, nullptr);
     HMODULE vk = LoadLibraryA("vulkan-1.dll");
@@ -71,7 +73,7 @@ int main() {
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd, surf, &caps);
     VkExtent2D ext = caps.currentExtent;
     VkSwapchainCreateInfoKHR swci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, nullptr, 0, surf, std::max(caps.minImageCount, 2u),
-                                      VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, ext, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                      fmt, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, ext, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                                       VK_SHARING_MODE_EXCLUSIVE, 0, nullptr, caps.currentTransform, VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
                                       VK_PRESENT_MODE_FIFO_KHR, VK_TRUE, VK_NULL_HANDLE };
     VkSwapchainKHR sc;
@@ -81,7 +83,7 @@ int main() {
     std::vector<VkImage> imgs(ni);
     vkGetSwapchainImagesKHR(dev, sc, &ni, imgs.data());
 
-    VkAttachmentDescription att = { 0, VK_FORMAT_B8G8R8A8_UNORM, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE,
+    VkAttachmentDescription att = { 0, fmt, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE,
                                     VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR };
     VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
     VkSubpassDescription sub = { 0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, nullptr, 1, &ref };
@@ -90,7 +92,7 @@ int main() {
     CHECK(vkCreateRenderPass(dev, &rpci, nullptr, &rp));
     std::vector<VkFramebuffer> fbs(ni);
     for (uint32_t i = 0; i < ni; i++) {
-        VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, nullptr, 0, imgs[i], VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM,
+        VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, nullptr, 0, imgs[i], VK_IMAGE_VIEW_TYPE_2D, fmt,
                                       {}, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
         VkImageView v;
         CHECK(vkCreateImageView(dev, &vci, nullptr, &v));
@@ -162,6 +164,9 @@ int main() {
         frames++;
     }
     vkDeviceWaitIdle(dev);
+    DFN(vkDestroySwapchainKHR); DFN(vkDestroyDevice);
+    vkDestroySwapchainKHR(dev, sc, nullptr);   // FortsGFX releases its own objects on the device first
+    vkDestroyDevice(dev, nullptr);
     printf("vktest: %u frames presented in %ux%u\n", frames, ext.width, ext.height);
     Sleep(1500);   // the PNG is written on a worker thread
     return 0;

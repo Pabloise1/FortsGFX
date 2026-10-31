@@ -187,6 +187,8 @@ bool GfxHudMasked();                // hooks: the HUD is hidden, ignore the game
 
 // ---- overlay.cpp ----
 void OverlayFrame();                // just before SwapBuffers, after the capture read-back
+void OverlayBridgeFrame(HWND wnd, GLuint fbo);   // Vulkan: the panel over the shared frame, input from wnd
+void OverlayToast(const char* text);             // a message at the bottom of the screen for a moment
 bool OverlayKeyBlocked(int vk);     // a hotkey is being bound in the panel, or vk was just bound: no hotkey fires
 typedef HRESULT (WINAPI* DI8CreateFn)(HINSTANCE, DWORD, const IID&, void**, void*);
 extern DI8CreateFn r_DirectInput8Create;
@@ -215,6 +217,9 @@ void GfxTourChapter(int chapter);              // showcase map: show this tour c
 bool GfxWaterVisible();                       // a sea is on screen (water effects running)
 void CapRequestPhoto();                      // photo mode: save this frame (no UI) to the Photos folder
 void CapSaveRgbaPng(const std::wstring& path, int w, int h, std::vector<uint8_t>&& rgba);   // on a worker thread
+void CapBridgePhoto(GLuint fbo);             // Vulkan: photo mode's save, from the bridge's shared frame
+
+bool GfxBridgeFrame(GLuint inTex, GLuint outFbo, int w, int h);   // Vulkan: FortsGFX's image stages on a shared frame
 
 // ---- vulkan.cpp ----
 void VkInstallHooks();               // Forts' Vulkan renderer: watch it (GetProcAddress in Forts.exe's imports)

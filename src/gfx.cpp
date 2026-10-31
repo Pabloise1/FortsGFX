@@ -1182,6 +1182,7 @@ static bool g_hudMasked;   // lab "hide HUD": colour writes are off from the end
 bool GfxHudMasked() { return g_hudMasked; }
 static unsigned g_frameNo;
 static GLuint g_outFbo;   // final pass target: 0 = back buffer (tools/replay.cpp redirects it)
+static bool g_bridge;     // a Vulkan frame (GfxBridgeFrame): only the image stages, nothing that needs the world
 // GPU stage timers, only used by tools/replay.cpp
 static bool g_profile;
 static GLuint g_timers[16];
@@ -4744,12 +4745,15 @@ static void RunPost() {
     G.BindVertexArray(g_vao);
     float tx = 1.0f / g_w, ty = 1.0f / g_h;
 
-    UpdateDayNight();
-    ProcessEvents();
-    BattleMarks();
-    for (GLuint tex : g_probeQueue) if (WeatherKind(tex) == 0) ProbeWeatherTexture(tex);
-    g_probeQueue.clear();
-    UpdateWeather();
+    if (g_bridge) g_dn = DayNight();   // a night with no lights in it would only be dark
+    else {
+        UpdateDayNight();
+        ProcessEvents();
+        BattleMarks();
+        for (GLuint tex : g_probeQueue) if (WeatherKind(tex) == 0) ProbeWeatherTexture(tex);
+        g_probeQueue.clear();
+        UpdateWeather();
+    }
     static Target raw;   // lab wipe: the game's own colours, before any of our effects are drawn in
     if (g_lab.wipe >= 0) {
         if (raw.w != g_w || raw.h != g_h) MakeTarget(raw, g_w, g_h, GL_RGBA8);
@@ -4759,11 +4763,13 @@ static void RunPost() {
         Bind(0, g_sceneTex);
         Draw(raw.fbo, g_w, g_h);
     }
-    RunWorldFx();
-    RunSnow();
-    DrawBolts();
+    if (!g_bridge) {
+        RunWorldFx();
+        RunSnow();
+        DrawBolts();
+    }
     Mark("world fx");
-    bool lit = cfg.lighting && g_pyramid > 0;
+    bool lit = !g_bridge && cfg.lighting && g_pyramid > 0;
     if (lit) { RunLighting(); Mark("lighting"); }
     else g_histValid = false;
     if (lit && CapOn()) RunDebugViews();
@@ -4913,7 +4919,7 @@ static void RunPost() {
     Bind(1, g_bloomLevels > 1 ? g_bloom[1].tex : g_bloom[0].tex); Bind(2, g_solidTex); Bind(3, g_emisTex);
     Bind(0, finalSrc);
     Draw(g_outFbo, g_w, g_h);
-    DrawFunOverlay();
+    if (!g_bridge) DrawFunOverlay();
     Mark("fxaa+final");
 
     if (g_debugView > 0) {   // control panel: show one buffer full screen
@@ -5247,6 +5253,54 @@ void GfxDebugTargets(std::vector<std::pair<GLuint, std::string>>& out) {
         const char* names[kDebugViews] = { "gi_masks", "gi_light", "gi_sky", "gi_distance", "gi_normals" };
         for (int i = 0; i < kDebugViews; i++) out.emplace_back(g_debug[i].tex, names[i]);
     }
+}
+
+// ---------------------------------------------------------------- Vulkan bridge (vulkan.cpp)
+
+// Forts' Vulkan renderer: vulkan.cpp shares each finished frame with its own GL context and calls this, with `inTex`
+// the frame and `outFbo` where the result goes (both the right way up for GL). Until the Vulkan draws are read - where
+// the playfield, solids and lights are, and where the world is - only the image stages run: the look, bloom from the
+// bright parts, grade, AA, sharpening, vignette and grain. Returns false when FortsGFX is off (F9) or can't run.
+bool GfxBridgeFrame(GLuint inTex, GLuint outFbo, int w, int h) {
+    if (!g_procsLoaded) {
+        g_procsLoaded = true;
+        LoadConfig();
+        if (!LoadProcs()) { g_failed = true; SessionLog("gfx: required GL entry points missing - disabled"); }
+    }
+    PerfFrame();
+    g_frameNo++;
+    PollKeys();
+    if (g_failed || !cfg.enabled || w <= 0 || h <= 0) return false;
+    if (!g_ready || w != g_w || h != g_h || cfg.giScale != g_giScaleBuilt) {
+        if (!CreateResources(w, h)) { g_failed = true; return false; }
+    }
+    // the frame becomes the world image: playfield everywhere, nothing solid or glowing yet
+    G.BindVertexArray(g_vao);
+    Use(g_pCopy);
+    U1i(g_pCopy, "uSrc", 0);
+    U1i(g_pCopy, "uAlpha", 0);
+    Bind(0, inTex);
+    Draw(g_worldFbo, w, h);
+    G.BindFramebuffer(GL_FRAMEBUFFER, g_worldFbo);
+    static const GLfloat playfield[4] = { 0, 0, 0, 1 }, zero[4] = { 0, 0, 0, 0 }, flat[4] = { 0.5f, 0.5f, 0, 0 };
+    G.ClearBufferfv(GL_COLOR, 1, playfield);
+    G.ClearBufferfv(GL_COLOR, 2, zero);
+    G.ClearBufferfv(GL_COLOR, 3, flat);
+    g_world[0] = 0; g_world[1] = (float)w; g_world[2] = 0; g_world[3] = (float)h;
+    bool fog = cfg.fog, mats = cfg.materials;
+    cfg.fog = false;          // both need the world: fog its height, materials the sprites' own normals
+    cfg.materials = false;
+    g_bridge = true;
+    g_outFbo = outFbo;
+    g_phase = kWorld;
+    RunPost();
+    g_outFbo = 0;
+    g_bridge = false;
+    g_phase = kOff;
+    cfg.fog = fog;
+    cfg.materials = mats;
+    if (g_hudMasked) { G.ColorMaski(0, 1, 1, 1, 1); g_hudMasked = false; }
+    return true;
 }
 
 // ---------------------------------------------------------------- offline replay (tools/replay.cpp)
